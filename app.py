@@ -374,7 +374,7 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
-# YOUTUBE CUTTER (RESOLVES CODE 8 MOOV ATOM ERROR)
+# YOUTUBE CUTTER (BYPASSES 403 VIA IOS/TV PROFILE + STRIPS AUDIO)
 # =====================================================================
 def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
     s_sec = time_to_sec(start_str)
@@ -385,7 +385,7 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     if duration < 5.0 or duration > 60.0:
         return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
 
-    # Clean URL down to base video ID
+    # Clean URL parameters
     clean_url = video_url.strip()
     if "youtu.be/" in clean_url:
         vid_id = clean_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
@@ -394,80 +394,55 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
         vid_id = clean_url.split("watch?v=")[1].split("&")[0]
         clean_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-    # Extract authenticated stream URL and headers via Android player client
+    target_mp4 = out_path if out_path.endswith(".mp4") else f"{out_path}.mp4"
+
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/best[ext=mp4]/best",
+        # Using iOS / TV player clients bypasses YouTube's datacenter 403 IP block
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"]
+                "player_client": ["ios", "tv_embedded", "mweb"]
             }
-        }
+        },
+        # Fetch best video stream up to 1080p
+        "format": "bestvideo[height<=1080]/best[height<=1080]/bestvideo/best",
+        "outtmpl": target_mp4,
+        "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
+        "force_keyframes_at_cuts": False,
+        "postprocessor_args": {
+            "ffmpeg": ["-an"]  # Audio stripped completely
+        },
+        "quiet": True,
+        "no_warnings": True,
+        "overwrites": True
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(clean_url, download=False)
+            ydl.download([clean_url])
+
+        if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 1000:
+            sz = os.path.getsize(target_mp4) / (1024 * 1024)
+            return True, f"{sz:.1f} MB (Silent B-roll)"
+
+        # Inspect if output saved under a different extension
+        base_no_ext, _ = os.path.splitext(target_mp4)
+        for ext in [".mkv", ".webm", ".mp4"]:
+            cand = f"{base_no_ext}{ext}"
+            if os.path.exists(cand) and os.path.getsize(cand) > 1000:
+                if cand != target_mp4:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", cand, "-an", "-c:v", "copy", target_mp4],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE
+                    )
+                    if os.path.exists(cand):
+                        os.remove(cand)
+                sz = os.path.getsize(target_mp4) / (1024 * 1024)
+                return True, f"{sz:.1f} MB (Silent B-roll)"
+
+        return False, "Trimming produced an empty file"
     except Exception as e:
-        return False, f"YouTube Extraction Error: {e}"
-
-    stream_url = info.get("url")
-    http_headers = info.get("http_headers", {})
-
-    if not stream_url:
-        formats = info.get("formats", [])
-        v_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-        if v_formats:
-            v_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-            stream_url = v_formats[0]["url"]
-            http_headers = v_formats[0].get("http_headers", {})
-        else:
-            return False, "Could not obtain video stream from link"
-
-    # Build HTTP headers for FFmpeg to satisfy Google Video's token check
-    header_str = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
-
-    # Fast stream copy (-i before -ss so FFmpeg reads moov atom header at byte 0)
-    cmd_copy = [
-        "ffmpeg", "-y",
-        "-headers", header_str,
-        "-i", stream_url,
-        "-ss", str(s_sec),
-        "-t", str(duration),
-        "-c:v", "copy",
-        "-an",
-        "-movflags", "+faststart",
-        out_path
-    ]
-    res_copy = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
-        sz = os.path.getsize(out_path) / (1024 * 1024)
-        return True, f"{sz:.1f} MB (Silent B-roll)"
-
-    # Fallback: ultrafast video-only re-encode if stream copy lands between keyframes
-    cmd_transcode = [
-        "ffmpeg", "-y",
-        "-headers", header_str,
-        "-i", stream_url,
-        "-ss", str(s_sec),
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "22",
-        "-an",
-        "-movflags", "+faststart",
-        out_path
-    ]
-    res_transcode = subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
-        sz = os.path.getsize(out_path) / (1024 * 1024)
-        return True, f"{sz:.1f} MB (Silent B-roll)"
-
-    err_detail = res_transcode.stderr[-200:] if res_transcode.stderr else res_copy.stderr[-200:]
-    return False, f"FFmpeg failed: {err_detail.strip()}"
+        return False, f"YouTube Trimming Error: {e}"
 
 
 # =====================================================================
