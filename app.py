@@ -3,6 +3,7 @@ import re
 import time
 import zipfile
 import io
+import subprocess
 import requests
 import yt_dlp
 import streamlit as st
@@ -84,7 +85,7 @@ TOOLS = {
     "YouTube Precision Cutter": {
         "tag": "youtube_clip",
         "ext": "mp4",
-        "desc": "Extracts precise 5-second to 60-second documentary scenes directly from any YouTube link without full video downloads.",
+        "desc": "Extracts video-only documentary scenes (silent B-roll, 5s to 60s) directly from any YouTube link without downloading full videos.",
         "type": "youtube",
         "auth_key": None
     },
@@ -373,9 +374,13 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
-# ROBUST YOUTUBE SEGMENT CUTTER (FIXES CODE 8 ERROR)
+# VIDEO-ONLY YOUTUBE SEGMENT CUTTER (ZERO AUDIO / NO CODEC ERRORS)
 # =====================================================================
 def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
+    """
+    Downloads only the video stream, stripping all audio tracks.
+    Eliminates all Opus/AAC codec conflicts and multi-stream sync crashes.
+    """
     s_sec = time_to_sec(start_str)
     e_sec = time_to_sec(end_str)
     if s_sec is None or e_sec is None:
@@ -384,7 +389,6 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     if duration < 5.0 or duration > 60.0:
         return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
 
-    # Clean URL (strip tracking parameters that break stream parsers)
     clean_url = video_url.strip()
     if "?si=" in clean_url:
         clean_url = clean_url.split("?si=")[0]
@@ -394,43 +398,79 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     base_path, _ = os.path.splitext(out_path)
     target_mp4 = f"{base_path}.mp4"
 
-    ydl_opts = {
-        # Select best progressive MP4 stream first, or clean DASH video + audio
-        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
-        "merge_output_format": "mp4",
-        "outtmpl": f"{base_path}.%(ext)s",
-        "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
-        # CRITICAL FIX: Disable keyframe re-encode filters that crash cloud ffmpeg with code 8
-        "force_keyframes_at_cuts": False,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"]
-            }
-        },
-        "quiet": True,
-        "no_warnings": True,
-        "overwrites": True
-    }
-
+    # Strategy 1: yt-dlp video-only stream cutting with postprocessor audio removal
     try:
+        ydl_opts = {
+            # Pick best video track up to 1080p, strictly ignore audio streams
+            "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/bestvideo",
+            "outtmpl": target_mp4,
+            "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
+            "force_keyframes_at_cuts": False,
+            "postprocessor_args": {
+                "ffmpeg": ["-an"]  # Force audio strip
+            },
+            "quiet": True,
+            "no_warnings": True,
+            "overwrites": True
+        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
 
         if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0:
             sz = os.path.getsize(target_mp4) / (1024 * 1024)
-            return True, f"{sz:.1f} MB"
+            return True, f"{sz:.1f} MB (Silent B-roll)"
+    except Exception:
+        pass
 
-        # Check for alternative extensions if merged into mkv/webm
-        for alt_ext in [".mkv", ".webm"]:
-            alt_path = f"{base_path}{alt_ext}"
-            if os.path.exists(alt_path) and os.path.getsize(alt_path) > 0:
-                os.rename(alt_path, target_mp4)
+    # Strategy 2: Direct video stream slice via native FFmpeg (Zero Audio)
+    try:
+        info_opts = {"quiet": True, "no_warnings": True}
+        with yt_dlp.YoutubeDL(info_opts) as ydl:
+            info = ydl.extract_info(clean_url, download=False)
+
+        formats = info.get("formats", [])
+        # Extract direct video-only stream URL
+        v_streams = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+        v_streams.sort(key=lambda x: (x.get("height") or 0), reverse=True)
+        video_stream_url = v_streams[0]["url"] if v_streams else info.get("url")
+
+        if video_stream_url:
+            # Fast copy first (completes in ~1 second)
+            cmd_copy = [
+                "ffmpeg", "-y",
+                "-ss", str(s_sec),
+                "-to", str(e_sec),
+                "-i", video_stream_url,
+                "-c:v", "copy",
+                "-an",
+                "-movflags", "+faststart",
+                target_mp4
+            ]
+            subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            # If stream copy encounters keyframe gaps, ultrafast transcode video only
+            if not (os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0):
+                cmd_transcode = [
+                    "ffmpeg", "-y",
+                    "-ss", str(s_sec),
+                    "-to", str(e_sec),
+                    "-i", video_stream_url,
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-crf", "22",
+                    "-an",
+                    "-movflags", "+faststart",
+                    target_mp4
+                ]
+                subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0:
                 sz = os.path.getsize(target_mp4) / (1024 * 1024)
-                return True, f"{sz:.1f} MB"
-
-        return False, "Trimming produced an empty file"
+                return True, f"{sz:.1f} MB (Silent B-roll)"
     except Exception as e:
-        return False, str(e)
+        return False, f"Trimming error: {e}"
+
+    return False, "Failed to cut video segment via available stream methods"
 
 
 # =====================================================================
@@ -647,12 +687,12 @@ with col_main:
                 out_path = os.path.join(OUTPUT_DIR, filename)
                 t0 = time.time()
 
-                with st.spinner(f"Extracting segment from {start_time} to {end_time}..."):
+                with st.spinner(f"Extracting silent video segment from {start_time} to {end_time}..."):
                     success, detail = cut_youtube(yt_url, start_time, end_time, out_path)
 
                 elapsed = time.time() - t0
                 if success:
-                    st.success(f"✓ **Saved Clip:** `{filename}` ({detail} in {elapsed:.1f}s)")
+                    st.success(f"✓ **Saved Silent B-Roll Clip:** `{filename}` ({detail} in {elapsed:.1f}s)")
                     st.video(out_path)
                     with open(out_path, "rb") as vf:
                         st.download_button(
