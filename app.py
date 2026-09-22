@@ -2,6 +2,7 @@ import os
 import re
 import time
 import zipfile
+import io
 import requests
 import yt_dlp
 import streamlit as st
@@ -28,8 +29,8 @@ OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MAX_VIDEO_SIZE_MB = 100.0
-MIN_IMAGE_SIZE_KB = 100.0   # Updated quality floor: 100 KB
-MAX_IMAGE_SIZE_MB = 10.0    # Quality ceiling: 10 MB
+MIN_IMAGE_SIZE_KB = 100.0   # Quality floor: 100 KB
+MAX_IMAGE_SIZE_MB = 10.0    # Quality cap: 10 MB
 
 GLOBAL_USER_AGENT = "BrollStudioAutomation/1.0 (documentary_research_tool; contact@studio.local)"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between"}
@@ -97,7 +98,7 @@ TOOLS = {
     "Wikimedia Commons Stills": {
         "tag": "wikimedia_still",
         "ext": "jpg",
-        "desc": "High-resolution public domain archival scans: vintage cartography maps, historical diagrams, ancient manuscripts, and seismograms.",
+        "desc": "High-resolution public domain archival scans: vintage cartography maps, historical diagrams, ancient manuscripts, and seismograms (100KB to 10MB).",
         "type": "search",
         "auth_key": None
     },
@@ -201,11 +202,11 @@ def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str]:
             return False, "No photos found"
         src = photos[0].get("src", {})
 
-        # Priority 1: Original raw uncompressed photo
+        # Priority 1: High-res uncompressed image
         img_url = src.get("original") or src.get("large2x")
         success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
 
-        # Priority 2: Fall back to large2x if original exceeded the 10 MB cap
+        # Priority 2: Fallback to large2x if original surpassed the 10 MB cap
         if not success and src.get("large2x") and img_url != src.get("large2x"):
             img_url = src.get("large2x")
             success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
@@ -402,10 +403,13 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
         return False, str(e)
 
 
+# =====================================================================
+# FAST MEMORY ZIP PACKAGING (NO RE-COMPRESSION OVERHEAD)
+# =====================================================================
 def create_zip_bytes(file_list: list[str]) -> bytes:
-    import io
+    """Uses ZIP_STORED to package pre-compressed media instantly without CPU lock."""
     mem_zip = io.BytesIO()
-    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
         for f in file_list:
             if os.path.exists(f):
                 zf.write(f, arcname=os.path.basename(f))
@@ -562,6 +566,7 @@ with col_main:
                 if successful_files:
                     st.markdown("### 📥 Save Assets to Your Computer")
                     
+                    # Instant zero-compression bundling
                     zip_data = create_zip_bytes([path for _, path, _ in successful_files])
                     st.download_button(
                         label="⬇️ Download All Files to Computer (.ZIP)",
