@@ -202,11 +202,9 @@ def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str]:
             return False, "No photos found"
         src = photos[0].get("src", {})
 
-        # Priority 1: High-res uncompressed image
         img_url = src.get("original") or src.get("large2x")
         success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
 
-        # Priority 2: Fallback to large2x if original surpassed the 10 MB cap
         if not success and src.get("large2x") and img_url != src.get("large2x"):
             img_url = src.get("large2x")
             success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
@@ -374,6 +372,9 @@ def time_to_sec(t_str: str) -> float | None:
     return None
 
 
+# =====================================================================
+# ROBUST YOUTUBE SEGMENT CUTTER (FIXES CODE 8 ERROR)
+# =====================================================================
 def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
     s_sec = time_to_sec(start_str)
     e_sec = time_to_sec(end_str)
@@ -383,31 +384,59 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     if duration < 5.0 or duration > 60.0:
         return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
 
+    # Clean URL (strip tracking parameters that break stream parsers)
+    clean_url = video_url.strip()
+    if "?si=" in clean_url:
+        clean_url = clean_url.split("?si=")[0]
+    elif "&si=" in clean_url:
+        clean_url = clean_url.split("&si=")[0]
+
+    base_path, _ = os.path.splitext(out_path)
+    target_mp4 = f"{base_path}.mp4"
+
     ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": out_path,
+        # Select best progressive MP4 stream first, or clean DASH video + audio
+        "format": "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": f"{base_path}.%(ext)s",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
-        "force_keyframes_at_cuts": True,
+        # CRITICAL FIX: Disable keyframe re-encode filters that crash cloud ffmpeg with code 8
+        "force_keyframes_at_cuts": False,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
         "quiet": True,
         "no_warnings": True,
         "overwrites": True
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            sz = os.path.getsize(out_path) / (1024 * 1024)
+            ydl.download([clean_url])
+
+        if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0:
+            sz = os.path.getsize(target_mp4) / (1024 * 1024)
             return True, f"{sz:.1f} MB"
+
+        # Check for alternative extensions if merged into mkv/webm
+        for alt_ext in [".mkv", ".webm"]:
+            alt_path = f"{base_path}{alt_ext}"
+            if os.path.exists(alt_path) and os.path.getsize(alt_path) > 0:
+                os.rename(alt_path, target_mp4)
+                sz = os.path.getsize(target_mp4) / (1024 * 1024)
+                return True, f"{sz:.1f} MB"
+
         return False, "Trimming produced an empty file"
     except Exception as e:
         return False, str(e)
 
 
 # =====================================================================
-# FAST MEMORY ZIP PACKAGING (NO RE-COMPRESSION OVERHEAD)
+# FAST ZERO-COMPRESSION ZIP BUNDLER
 # =====================================================================
 def create_zip_bytes(file_list: list[str]) -> bytes:
-    """Uses ZIP_STORED to package pre-compressed media instantly without CPU lock."""
     mem_zip = io.BytesIO()
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
         for f in file_list:
@@ -430,7 +459,7 @@ ENGINE_DISPATCH = {
 }
 
 # =====================================================================
-# STREAMLIT PAGE SETUP & CUSTOM STYLING
+# STREAMLIT UI SETUP
 # =====================================================================
 st.set_page_config(page_title="Automation Tools By Shoaib Malik", page_icon="🎬", layout="wide")
 
@@ -452,7 +481,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# SECURITY GATEKEEPER
+# SECURITY LOGIN GATEKEEPER
 # =====================================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -482,7 +511,7 @@ if not st.session_state.authenticated:
     st.stop()
 
 # =====================================================================
-# AUTHENTICATED USER INTERFACE
+# AUTHENTICATED WORKSPACE
 # =====================================================================
 col_header, col_logout = st.columns([4, 1])
 with col_header:
@@ -566,7 +595,6 @@ with col_main:
                 if successful_files:
                     st.markdown("### 📥 Save Assets to Your Computer")
                     
-                    # Instant zero-compression bundling
                     zip_data = create_zip_bytes([path for _, path, _ in successful_files])
                     st.download_button(
                         label="⬇️ Download All Files to Computer (.ZIP)",
@@ -604,9 +632,9 @@ with col_main:
         yt_url = st.text_input("YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
         col_t1, col_t2 = st.columns(2)
         with col_t1:
-            start_time = st.text_input("Start Timestamp (MM:SS):", value="00:15")
+            start_time = st.text_input("Start Timestamp (MM:SS):", value="03:15")
         with col_t2:
-            end_time = st.text_input("End Timestamp (MM:SS):", value="00:35")
+            end_time = st.text_input("End Timestamp (MM:SS):", value="03:35")
 
         custom_label = st.text_input("Target File Title (Prompt/Label):", value="youtube_documentary_scene")
         yt_btn = st.button("Extract Clip (5s to 60s)", type="primary")
