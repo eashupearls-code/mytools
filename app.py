@@ -28,8 +28,8 @@ OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MAX_VIDEO_SIZE_MB = 100.0
-MIN_IMAGE_SIZE_KB = 500.0
-MAX_IMAGE_SIZE_MB = 10.0
+MIN_IMAGE_SIZE_KB = 100.0   # Updated quality floor: 100 KB
+MAX_IMAGE_SIZE_MB = 10.0    # Quality ceiling: 10 MB
 
 GLOBAL_USER_AGENT = "BrollStudioAutomation/1.0 (documentary_research_tool; contact@studio.local)"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between"}
@@ -48,7 +48,7 @@ TOOLS = {
     "Stock Photos": {
         "tag": "stock_photo",
         "ext": "jpg",
-        "desc": "Crisp high-resolution modern photography and portraits (500KB to 10MB) for Ken Burns documentary animation.",
+        "desc": "Crisp high-resolution modern photography and portraits (100KB to 10MB) for Ken Burns documentary animation.",
         "type": "search",
         "auth_key": "PEXELS_API_KEY"
     },
@@ -62,7 +62,7 @@ TOOLS = {
     "Pixabay Stock Photos": {
         "tag": "pixabay_photo",
         "ext": "jpg",
-        "desc": "High-resolution commercial stock stills, landscapes, architecture, and environmental details.",
+        "desc": "High-resolution commercial stock stills, landscapes, architecture, and environmental details (100KB to 10MB).",
         "type": "search",
         "auth_key": "PIXABAY_API_KEY"
     },
@@ -76,7 +76,7 @@ TOOLS = {
     "Unsplash Editorial Photos": {
         "tag": "unsplash_photo",
         "ext": "jpg",
-        "desc": "Award-winning photographic lighting, premium character portraits, architecture, and fine-art editorial stills.",
+        "desc": "Award-winning photographic lighting, premium character portraits, architecture, and fine-art editorial stills (100KB to 10MB).",
         "type": "search",
         "auth_key": "UNSPLASH_ACCESS_KEY"
     },
@@ -158,7 +158,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = MAX_VIDEO_S
                 for chunk in r.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
-            return True, f"{total_mb:.1f} MB"
+            return True, f"{total_mb:.1f} MB" if total_mb >= 1.0 else f"{total_kb:.1f} KB"
     except Exception as e:
         if os.path.exists(output_path):
             os.remove(output_path)
@@ -199,8 +199,18 @@ def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str]:
         photos = r.json().get("photos", [])
         if not photos:
             return False, "No photos found"
-        img_url = photos[0]["src"].get("large2x") or photos[0]["src"].get("original")
-        return download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        src = photos[0].get("src", {})
+
+        # Priority 1: Original raw uncompressed photo
+        img_url = src.get("original") or src.get("large2x")
+        success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+
+        # Priority 2: Fall back to large2x if original exceeded the 10 MB cap
+        if not success and src.get("large2x") and img_url != src.get("large2x"):
+            img_url = src.get("large2x")
+            success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+
+        return success, detail
     except Exception as e:
         return False, str(e)
 
@@ -392,13 +402,15 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
         return False, str(e)
 
 
-def create_zip_archive(files: list[str]) -> str:
-    zip_path = os.path.join(OUTPUT_DIR, "batch_assets.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for f in files:
+def create_zip_bytes(file_list: list[str]) -> bytes:
+    import io
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in file_list:
             if os.path.exists(f):
-                zipf.write(f, arcname=os.path.basename(f))
-    return zip_path
+                zf.write(f, arcname=os.path.basename(f))
+    mem_zip.seek(0)
+    return mem_zip.read()
 
 
 ENGINE_DISPATCH = {
@@ -420,13 +432,11 @@ st.set_page_config(page_title="Automation Tools By Shoaib Malik", page_icon="�
 
 st.markdown("""
 <style>
-    /* Scale up radio button labels */
     div[data-testid="stRadio"] label p {
         font-size: 1.15rem !important;
         font-weight: 500 !important;
         line-height: 1.8 !important;
     }
-    /* Scale up radio button circles */
     div[data-testid="stRadio"] [data-baseweb="radio"] div:first-child {
         transform: scale(1.35);
         margin-right: 0.6rem !important;
@@ -438,7 +448,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =====================================================================
-# HARDCODED SECURITY GATEKEEPER
+# SECURITY GATEKEEPER
 # =====================================================================
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
@@ -465,10 +475,10 @@ if not st.session_state.authenticated:
                 else:
                     st.error("Incorrect Username or Password. Access Denied.")
 
-    st.stop()  # Halts app execution here until authenticated
+    st.stop()
 
 # =====================================================================
-# AUTHENTICATED USER INTERFACE (VISIBLE ONLY AFTER LOGIN)
+# AUTHENTICATED USER INTERFACE
 # =====================================================================
 col_header, col_logout = st.columns([4, 1])
 with col_header:
@@ -508,9 +518,9 @@ with col_main:
         prompt_input = st.text_area(
             "Paste Visual Prompts (one prompt per line):",
             height=180,
-            placeholder="river drone aerial\ngerman city traffic\nscientist microscope lab"
+            placeholder="geologist holding rock sample\nmountain peak sunrise landscape\nancient roman architecture"
         )
-        start_btn = st.button(f"Start Downloading ({selected_tool_name})", type="primary")
+        start_btn = st.button(f"Start Sourcing ({selected_tool_name})", type="primary")
 
         if start_btn:
             lines = [line.strip() for line in prompt_input.splitlines() if line.strip()]
@@ -525,7 +535,7 @@ with col_main:
                 successful_files = []
 
                 with status_box:
-                    st.write(f"**Starting batch download for {len(lines)} prompt(s)...**")
+                    st.write(f"**Fetching {len(lines)} asset(s)...**")
                     for idx, raw_prompt in enumerate(lines):
                         filename = prompt_to_clean_filename(raw_prompt, ext)
                         out_path = os.path.join(OUTPUT_DIR, filename)
@@ -540,26 +550,49 @@ with col_main:
 
                         elapsed = time.time() - t0
                         if success:
-                            st.success(f"✓ **Saved:** `{filename}` ({detail} in {elapsed:.1f}s)")
-                            successful_files.append(out_path)
+                            st.success(f"✓ **Retrieved:** `{filename}` ({detail} in {elapsed:.1f}s)")
+                            successful_files.append((filename, out_path, ext))
                         else:
                             st.error(f"✖ **Failed:** \"{raw_prompt}\" — {detail}")
 
                         progress_bar.progress((idx + 1) / len(lines))
 
                 st.balloons()
-                st.success(f"Batch completed! All assets are saved on the server.")
 
                 if successful_files:
-                    zip_archive = create_zip_archive(successful_files)
-                    with open(zip_archive, "rb") as zf:
-                        st.download_button(
-                            label="📥 Download All Files as ZIP",
-                            data=zf,
-                            file_name="downloaded_broll.zip",
-                            mime="application/zip",
-                            type="secondary"
-                        )
+                    st.markdown("### 📥 Save Assets to Your Computer")
+                    
+                    zip_data = create_zip_bytes([path for _, path, _ in successful_files])
+                    st.download_button(
+                        label="⬇️ Download All Files to Computer (.ZIP)",
+                        data=zip_data,
+                        file_name="broll_assets.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+                    st.divider()
+
+                    st.markdown("#### Individual Asset Previews")
+                    for fname, fpath, fext in successful_files:
+                        col_preview, col_info = st.columns([1.5, 1])
+                        with col_preview:
+                            if fext == "mp4":
+                                st.video(fpath)
+                            else:
+                                st.image(fpath)
+                        with col_info:
+                            st.write(f"**File:** `{fname}`")
+                            with open(fpath, "rb") as item_f:
+                                st.download_button(
+                                    label=f"⬇️ Download {fname}",
+                                    data=item_f.read(),
+                                    file_name=fname,
+                                    mime="video/mp4" if fext == "mp4" else "image/jpeg",
+                                    key=f"dl_{fname}"
+                                )
+                        st.write("---")
 
     elif tool_info["type"] == "youtube":
         st.markdown("#### Precision Clip Trimmer")
@@ -590,10 +623,12 @@ with col_main:
                     st.video(out_path)
                     with open(out_path, "rb") as vf:
                         st.download_button(
-                            label=f"📥 Download {filename}",
-                            data=vf,
+                            label=f"⬇️ Download {filename} to PC",
+                            data=vf.read(),
                             file_name=filename,
-                            mime="video/mp4"
+                            mime="video/mp4",
+                            type="primary",
+                            use_container_width=True
                         )
                 else:
                     st.error(f"✖ **Trimming Failed:** {detail}")
