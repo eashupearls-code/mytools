@@ -5,7 +5,6 @@ import zipfile
 import io
 import subprocess
 import requests
-import yt_dlp
 import streamlit as st
 
 # =====================================================================
@@ -82,11 +81,11 @@ TOOLS = {
         "type": "search",
         "auth_key": "UNSPLASH_ACCESS_KEY"
     },
-    "YouTube Precision Cutter": {
-        "tag": "youtube_clip",
+    "Universal Video Trimmer": {
+        "tag": "universal_clip",
         "ext": "mp4",
-        "desc": "Extracts silent video documentary scenes (B-roll only, 5s to 60s) directly from any YouTube link without downloading full videos.",
-        "type": "youtube",
+        "desc": "Extracts precise 5s to 60s silent B-roll segments from any direct video link (Google Drive, Archive.org, Dropbox, or MP4 URLs).",
+        "type": "universal_trim",
         "auth_key": None
     },
     "NASA Science & Earth": {
@@ -374,9 +373,9 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
-# YOUTUBE CUTTER: PERMISSIVE FORMAT MATCHER + SILENT B-ROLL STRIP
+# UNIVERSAL VIDEO STREAM TRIMMER (ZERO DATACENTER 403 ISSUES)
 # =====================================================================
-def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
+def cut_universal_video(source_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
     s_sec = time_to_sec(start_str)
     e_sec = time_to_sec(end_str)
     if s_sec is None or e_sec is None:
@@ -385,88 +384,35 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     if duration < 5.0 or duration > 60.0:
         return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
 
-    # Clean URL parameters
-    clean_url = video_url.strip()
-    if "youtu.be/" in clean_url:
-        vid_id = clean_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
-        clean_url = f"https://www.youtube.com/watch?v={vid_id}"
-    elif "watch?v=" in clean_url:
-        vid_id = clean_url.split("watch?v=")[1].split("&")[0]
-        clean_url = f"https://www.youtube.com/watch?v={vid_id}"
+    # Convert common cloud share links (Dropbox/Google Drive) to direct download streams
+    clean_url = source_url.strip()
+    if "dropbox.com" in clean_url and "dl=0" in clean_url:
+        clean_url = clean_url.replace("dl=0", "dl=1")
+    elif "drive.google.com/file/d/" in clean_url:
+        file_id = clean_url.split("/d/")[1].split("/")[0]
+        clean_url = f"https://drive.google.com/uc?export=download&id={file_id}"
 
-    target_mp4 = out_path if out_path.endswith(".mp4") else f"{out_path}.mp4"
-    temp_dir = os.path.join(OUTPUT_DIR, "temp_yt")
-    os.makedirs(temp_dir, exist_ok=True)
-    temp_base = os.path.join(temp_dir, f"raw_{int(time.time() * 1000)}")
-
-    # Permissive selector: accepts ANY valid video stream available from mobile/TV clients
-    ydl_opts = {
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["tv_embedded", "ios", "mweb", "android"]
-            }
-        },
-        # b* matches any stream containing video (fixes 'Requested format is not available')
-        "format": "b*[ext=mp4]/b*/bv*/best",
-        "outtmpl": f"{temp_base}.%(ext)s",
-        "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
-        "force_keyframes_at_cuts": False,
-        "quiet": True,
-        "no_warnings": True,
-        "overwrites": True
-    }
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(s_sec),
+        "-i", clean_url,
+        "-t", str(duration),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "22",
+        "-an",
+        "-movflags", "+faststart",
+        out_path
+    ]
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([clean_url])
-
-        # Find whichever container yt-dlp produced (.mp4, .mkv, .webm)
-        found_file = None
-        for ext in [".mp4", ".mkv", ".webm", ".ts"]:
-            candidate = f"{temp_base}{ext}"
-            if os.path.exists(candidate) and os.path.getsize(candidate) > 1000:
-                found_file = candidate
-                break
-
-        if not found_file:
-            return False, "Could not extract video segment from YouTube"
-
-        # Fast-copy pass: strips audio completely (-an) to create silent B-roll
-        cmd_copy = [
-            "ffmpeg", "-y",
-            "-i", found_file,
-            "-an",
-            "-c:v", "copy",
-            "-movflags", "+faststart",
-            target_mp4
-        ]
-        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Fallback transcode if stream-copying fails between keyframes
-        if not (os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 1000):
-            cmd_transcode = [
-                "ffmpeg", "-y",
-                "-i", found_file,
-                "-an",
-                "-c:v", "libx264",
-                "-preset", "ultrafast",
-                "-crf", "22",
-                "-movflags", "+faststart",
-                target_mp4
-            ]
-            subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        # Clean up temporary raw chunk
-        if os.path.exists(found_file):
-            os.remove(found_file)
-
-        if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 1000:
-            sz = os.path.getsize(target_mp4) / (1024 * 1024)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            sz = os.path.getsize(out_path) / (1024 * 1024)
             return True, f"{sz:.1f} MB (Silent B-roll)"
-
         return False, "Trimming produced an empty file"
     except Exception as e:
-        return False, f"YouTube Trimming Error: {e}"
+        return False, f"Video trimming error: {e}"
 
 
 # =====================================================================
@@ -663,28 +609,30 @@ with col_main:
                                 )
                         st.write("---")
 
-    elif tool_info["type"] == "youtube":
-        st.markdown("#### Precision Clip Trimmer")
-        yt_url = st.text_input("YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
+    elif tool_info["type"] == "universal_trim":
+        st.markdown("#### Direct Video Stream Trimmer")
+        st.caption("Paste any public `.mp4`, Archive.org, Vimeo, Google Drive, or Dropbox video link:")
+        v_url = st.text_input("Source Video URL:", placeholder="https://ia800201.us.archive.org/.../sample.mp4")
+        
         col_t1, col_t2 = st.columns(2)
         with col_t1:
-            start_time = st.text_input("Start Timestamp (MM:SS):", value="04:15")
+            start_time = st.text_input("Start Timestamp (MM:SS):", value="00:15")
         with col_t2:
-            end_time = st.text_input("End Timestamp (MM:SS):", value="04:30")
+            end_time = st.text_input("End Timestamp (MM:SS):", value="00:35")
 
-        custom_label = st.text_input("Target File Title (Prompt/Label):", value="youtube_documentary_scene")
-        yt_btn = st.button("Extract Clip (5s to 60s)", type="primary")
+        custom_label = st.text_input("Target File Title (Prompt/Label):", value="documentary_broll_clip")
+        trim_btn = st.button("Extract Clip (5s to 60s)", type="primary")
 
-        if yt_btn:
-            if not yt_url:
-                st.warning("Please provide a valid YouTube URL.")
+        if trim_btn:
+            if not v_url:
+                st.warning("Please provide a valid video URL.")
             else:
                 filename = prompt_to_clean_filename(custom_label, "mp4")
                 out_path = os.path.join(OUTPUT_DIR, filename)
                 t0 = time.time()
 
                 with st.spinner(f"Extracting silent video segment from {start_time} to {end_time}..."):
-                    success, detail = cut_youtube(yt_url, start_time, end_time, out_path)
+                    success, detail = cut_universal_video(v_url, start_time, end_time, out_path)
 
                 elapsed = time.time() - t0
                 if success:
@@ -701,3 +649,12 @@ with col_main:
                         )
                 else:
                     st.error(f"✖ **Trimming Failed:** {detail}")
+
+        st.divider()
+        st.markdown("#### Need to Trim YouTube Specifically?")
+        st.write("Cloud servers (AWS) are blocked by YouTube's datacenter firewalls. Use these fast, free browser-side cutters that use your home internet IP:")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.link_button("🌐 Open YT-Clipper (Timestamp Cutter)", "https://www.yt-clipper.com/", use_container_width=True)
+        with c2:
+            st.link_button("⚡ Open Cobalt (Direct Video Downloader)", "https://cobalt.tools/", use_container_width=True)
