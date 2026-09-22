@@ -85,7 +85,7 @@ TOOLS = {
     "YouTube Precision Cutter": {
         "tag": "youtube_clip",
         "ext": "mp4",
-        "desc": "Extracts video-only documentary scenes (silent B-roll, 5s to 60s) directly from any YouTube link without downloading full videos.",
+        "desc": "Extracts silent video documentary scenes (B-roll only, 5s to 60s) directly from any YouTube link without downloading full videos.",
         "type": "youtube",
         "auth_key": None
     },
@@ -374,7 +374,7 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
-# YOUTUBE CUTTER (BYPASSES 403 VIA IOS/TV PROFILE + STRIPS AUDIO)
+# YOUTUBE CUTTER: PERMISSIVE FORMAT MATCHER + SILENT B-ROLL STRIP
 # =====================================================================
 def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
     s_sec = time_to_sec(start_str)
@@ -395,22 +395,22 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
         clean_url = f"https://www.youtube.com/watch?v={vid_id}"
 
     target_mp4 = out_path if out_path.endswith(".mp4") else f"{out_path}.mp4"
+    temp_dir = os.path.join(OUTPUT_DIR, "temp_yt")
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_base = os.path.join(temp_dir, f"raw_{int(time.time() * 1000)}")
 
+    # Permissive selector: accepts ANY valid video stream available from mobile/TV clients
     ydl_opts = {
-        # Using iOS / TV player clients bypasses YouTube's datacenter 403 IP block
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "tv_embedded", "mweb"]
+                "player_client": ["tv_embedded", "ios", "mweb", "android"]
             }
         },
-        # Fetch best video stream up to 1080p
-        "format": "bestvideo[height<=1080]/best[height<=1080]/bestvideo/best",
-        "outtmpl": target_mp4,
+        # b* matches any stream containing video (fixes 'Requested format is not available')
+        "format": "b*[ext=mp4]/b*/bv*/best",
+        "outtmpl": f"{temp_base}.%(ext)s",
         "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
         "force_keyframes_at_cuts": False,
-        "postprocessor_args": {
-            "ffmpeg": ["-an"]  # Audio stripped completely
-        },
         "quiet": True,
         "no_warnings": True,
         "overwrites": True
@@ -420,25 +420,49 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
 
+        # Find whichever container yt-dlp produced (.mp4, .mkv, .webm)
+        found_file = None
+        for ext in [".mp4", ".mkv", ".webm", ".ts"]:
+            candidate = f"{temp_base}{ext}"
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 1000:
+                found_file = candidate
+                break
+
+        if not found_file:
+            return False, "Could not extract video segment from YouTube"
+
+        # Fast-copy pass: strips audio completely (-an) to create silent B-roll
+        cmd_copy = [
+            "ffmpeg", "-y",
+            "-i", found_file,
+            "-an",
+            "-c:v", "copy",
+            "-movflags", "+faststart",
+            target_mp4
+        ]
+        subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Fallback transcode if stream-copying fails between keyframes
+        if not (os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 1000):
+            cmd_transcode = [
+                "ffmpeg", "-y",
+                "-i", found_file,
+                "-an",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "22",
+                "-movflags", "+faststart",
+                target_mp4
+            ]
+            subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        # Clean up temporary raw chunk
+        if os.path.exists(found_file):
+            os.remove(found_file)
+
         if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 1000:
             sz = os.path.getsize(target_mp4) / (1024 * 1024)
             return True, f"{sz:.1f} MB (Silent B-roll)"
-
-        # Inspect if output saved under a different extension
-        base_no_ext, _ = os.path.splitext(target_mp4)
-        for ext in [".mkv", ".webm", ".mp4"]:
-            cand = f"{base_no_ext}{ext}"
-            if os.path.exists(cand) and os.path.getsize(cand) > 1000:
-                if cand != target_mp4:
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", cand, "-an", "-c:v", "copy", target_mp4],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    if os.path.exists(cand):
-                        os.remove(cand)
-                sz = os.path.getsize(target_mp4) / (1024 * 1024)
-                return True, f"{sz:.1f} MB (Silent B-roll)"
 
         return False, "Trimming produced an empty file"
     except Exception as e:
@@ -644,9 +668,9 @@ with col_main:
         yt_url = st.text_input("YouTube Video URL:", placeholder="https://www.youtube.com/watch?v=...")
         col_t1, col_t2 = st.columns(2)
         with col_t1:
-            start_time = st.text_input("Start Timestamp (MM:SS):", value="03:15")
+            start_time = st.text_input("Start Timestamp (MM:SS):", value="04:15")
         with col_t2:
-            end_time = st.text_input("End Timestamp (MM:SS):", value="03:35")
+            end_time = st.text_input("End Timestamp (MM:SS):", value="04:30")
 
         custom_label = st.text_input("Target File Title (Prompt/Label):", value="youtube_documentary_scene")
         yt_btn = st.button("Extract Clip (5s to 60s)", type="primary")
