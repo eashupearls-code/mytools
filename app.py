@@ -374,13 +374,9 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
-# VIDEO-ONLY YOUTUBE SEGMENT CUTTER (ZERO AUDIO / NO CODEC ERRORS)
+# YOUTUBE CUTTER (RESOLVES CODE 8 MOOV ATOM ERROR)
 # =====================================================================
 def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
-    """
-    Downloads only the video stream, stripping all audio tracks.
-    Eliminates all Opus/AAC codec conflicts and multi-stream sync crashes.
-    """
     s_sec = time_to_sec(start_str)
     e_sec = time_to_sec(end_str)
     if s_sec is None or e_sec is None:
@@ -389,88 +385,89 @@ def cut_youtube(video_url: str, start_str: str, end_str: str, out_path: str) -> 
     if duration < 5.0 or duration > 60.0:
         return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
 
+    # Clean URL down to base video ID
     clean_url = video_url.strip()
-    if "?si=" in clean_url:
-        clean_url = clean_url.split("?si=")[0]
-    elif "&si=" in clean_url:
-        clean_url = clean_url.split("&si=")[0]
+    if "youtu.be/" in clean_url:
+        vid_id = clean_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
+        clean_url = f"https://www.youtube.com/watch?v={vid_id}"
+    elif "watch?v=" in clean_url:
+        vid_id = clean_url.split("watch?v=")[1].split("&")[0]
+        clean_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-    base_path, _ = os.path.splitext(out_path)
-    target_mp4 = f"{base_path}.mp4"
-
-    # Strategy 1: yt-dlp video-only stream cutting with postprocessor audio removal
-    try:
-        ydl_opts = {
-            # Pick best video track up to 1080p, strictly ignore audio streams
-            "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/bestvideo",
-            "outtmpl": target_mp4,
-            "download_ranges": yt_dlp.utils.download_range_func(None, [(s_sec, e_sec)]),
-            "force_keyframes_at_cuts": False,
-            "postprocessor_args": {
-                "ffmpeg": ["-an"]  # Force audio strip
-            },
-            "quiet": True,
-            "no_warnings": True,
-            "overwrites": True
+    # Extract authenticated stream URL and headers via Android player client
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": "bestvideo[height<=1080][ext=mp4]/bestvideo[height<=1080]/best[ext=mp4]/best",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([clean_url])
+    }
 
-        if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0:
-            sz = os.path.getsize(target_mp4) / (1024 * 1024)
-            return True, f"{sz:.1f} MB (Silent B-roll)"
-    except Exception:
-        pass
-
-    # Strategy 2: Direct video stream slice via native FFmpeg (Zero Audio)
     try:
-        info_opts = {"quiet": True, "no_warnings": True}
-        with yt_dlp.YoutubeDL(info_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(clean_url, download=False)
-
-        formats = info.get("formats", [])
-        # Extract direct video-only stream URL
-        v_streams = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
-        v_streams.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-        video_stream_url = v_streams[0]["url"] if v_streams else info.get("url")
-
-        if video_stream_url:
-            # Fast copy first (completes in ~1 second)
-            cmd_copy = [
-                "ffmpeg", "-y",
-                "-ss", str(s_sec),
-                "-to", str(e_sec),
-                "-i", video_stream_url,
-                "-c:v", "copy",
-                "-an",
-                "-movflags", "+faststart",
-                target_mp4
-            ]
-            subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            # If stream copy encounters keyframe gaps, ultrafast transcode video only
-            if not (os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0):
-                cmd_transcode = [
-                    "ffmpeg", "-y",
-                    "-ss", str(s_sec),
-                    "-to", str(e_sec),
-                    "-i", video_stream_url,
-                    "-c:v", "libx264",
-                    "-preset", "ultrafast",
-                    "-crf", "22",
-                    "-an",
-                    "-movflags", "+faststart",
-                    target_mp4
-                ]
-                subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            if os.path.exists(target_mp4) and os.path.getsize(target_mp4) > 0:
-                sz = os.path.getsize(target_mp4) / (1024 * 1024)
-                return True, f"{sz:.1f} MB (Silent B-roll)"
     except Exception as e:
-        return False, f"Trimming error: {e}"
+        return False, f"YouTube Extraction Error: {e}"
 
-    return False, "Failed to cut video segment via available stream methods"
+    stream_url = info.get("url")
+    http_headers = info.get("http_headers", {})
+
+    if not stream_url:
+        formats = info.get("formats", [])
+        v_formats = [f for f in formats if f.get("vcodec") != "none" and f.get("url")]
+        if v_formats:
+            v_formats.sort(key=lambda x: (x.get("height") or 0), reverse=True)
+            stream_url = v_formats[0]["url"]
+            http_headers = v_formats[0].get("http_headers", {})
+        else:
+            return False, "Could not obtain video stream from link"
+
+    # Build HTTP headers for FFmpeg to satisfy Google Video's token check
+    header_str = "".join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+
+    # Fast stream copy (-i before -ss so FFmpeg reads moov atom header at byte 0)
+    cmd_copy = [
+        "ffmpeg", "-y",
+        "-headers", header_str,
+        "-i", stream_url,
+        "-ss", str(s_sec),
+        "-t", str(duration),
+        "-c:v", "copy",
+        "-an",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    res_copy = subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
+        sz = os.path.getsize(out_path) / (1024 * 1024)
+        return True, f"{sz:.1f} MB (Silent B-roll)"
+
+    # Fallback: ultrafast video-only re-encode if stream copy lands between keyframes
+    cmd_transcode = [
+        "ffmpeg", "-y",
+        "-headers", header_str,
+        "-i", stream_url,
+        "-ss", str(s_sec),
+        "-t", str(duration),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "22",
+        "-an",
+        "-movflags", "+faststart",
+        out_path
+    ]
+    res_transcode = subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 10000:
+        sz = os.path.getsize(out_path) / (1024 * 1024)
+        return True, f"{sz:.1f} MB (Silent B-roll)"
+
+    err_detail = res_transcode.stderr[-200:] if res_transcode.stderr else res_copy.stderr[-200:]
+    return False, f"FFmpeg failed: {err_detail.strip()}"
 
 
 # =====================================================================
