@@ -6,6 +6,7 @@ import io
 import subprocess
 import tempfile
 import requests
+import shutil
 import streamlit as st
 
 # =====================================================================
