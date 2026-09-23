@@ -4,6 +4,7 @@ import time
 import zipfile
 import io
 import subprocess
+import tempfile
 import requests
 import streamlit as st
 
@@ -86,6 +87,13 @@ TOOLS = {
         "ext": "mp4",
         "desc": "Extracts precise 5s to 60s silent B-roll segments from any direct video link (Google Drive, Archive.org, Dropbox, or MP4 URLs).",
         "type": "universal_trim",
+        "auth_key": None
+    },
+    "YouTube Clip Downloader": {
+        "tag": "youtube_clip",
+        "ext": "mp4",
+        "desc": "Download an authorized YouTube video section by timestamp, with up to 4K quality when available.",
+        "type": "youtube_clip",
         "auth_key": None
     },
     "NASA Science & Earth": {
@@ -373,6 +381,213 @@ def time_to_sec(t_str: str) -> float | None:
 
 
 # =====================================================================
+# YOUTUBE CLIP DOWNLOADER
+# =====================================================================
+YOUTUBE_QUALITY_OPTIONS = {
+    "Best Available": None,
+    "4K (2160p)": 2160,
+    "2K (1440p)": 1440,
+    "1080p": 1080,
+    "720p": 720,
+    "480p": 480,
+    "360p": 360,
+}
+
+
+def youtube_time_to_seconds(value: str) -> int:
+    value = str(value).strip()
+    if not value:
+        raise ValueError("Time cannot be empty.")
+
+    parts = value.split(":")
+
+    try:
+        if len(parts) == 1:
+            return int(parts[0])
+
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            if seconds >= 60:
+                raise ValueError
+            return minutes * 60 + seconds
+
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            if minutes >= 60 or seconds >= 60:
+                raise ValueError
+            return hours * 3600 + minutes * 60 + seconds
+
+        raise ValueError
+    except ValueError:
+        raise ValueError("Invalid time format. Use HH:MM:SS or MM:SS.")
+
+
+def youtube_format_time(seconds: int) -> str:
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def youtube_safe_filename(text: str) -> str:
+    text = re.sub(r'[<>:"/\\|?*]', "", str(text))
+    text = re.sub(r"\s+", " ", text).strip()
+    return (text[:120] or "YouTube Clip")
+
+
+def get_youtube_video_info(url: str):
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError(
+            "yt-dlp is not installed. Add yt-dlp to requirements.txt "
+            "or run: python -m pip install -U yt-dlp"
+        )
+
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def get_youtube_format(height):
+    if height is None:
+        return "bestvideo+bestaudio/best"
+
+    return (
+        f"bestvideo[height<={height}][ext=mp4][vcodec^=avc1]+"
+        f"bestaudio[ext=m4a]/"
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}]"
+    )
+
+
+def download_youtube_clip(
+    url: str,
+    start_seconds: int,
+    end_seconds: int,
+    quality: str,
+    output_directory: str,
+    title: str,
+) -> str:
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError(
+            "yt-dlp is not installed. Add yt-dlp to requirements.txt "
+            "or run: python -m pip install -U yt-dlp"
+        )
+
+    os.makedirs(output_directory, exist_ok=True)
+
+    max_height = YOUTUBE_QUALITY_OPTIONS[quality]
+    format_selector = get_youtube_format(max_height)
+
+    download_ranges = yt_dlp.utils.download_range_func(
+        None,
+        [(start_seconds, end_seconds)],
+    )
+
+    output_template = os.path.join(
+        output_directory,
+        "youtube_clip.%(ext)s"
+    )
+
+    options = {
+        "format": format_selector,
+        "noplaylist": True,
+        "outtmpl": output_template,
+        "download_ranges": download_ranges,
+        "force_keyframes_at_cuts": False,
+        "merge_output_format": "mp4",
+        "nopart": False,
+        "quiet": True,
+        "no_warnings": True,
+        "writethumbnail": False,
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "writeinfojson": False,
+        "writedescription": False,
+        "writeannotations": False,
+    }
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+    media_files = []
+    for file in Path(output_directory).iterdir():
+        if file.is_file() and file.suffix.lower() in {
+            ".mp4", ".mkv", ".webm", ".mov", ".m4v"
+        }:
+            media_files.append(file)
+
+    if not media_files:
+        raise RuntimeError("yt-dlp did not create a video clip.")
+
+    media_files.sort(
+        key=lambda x: x.stat().st_mtime,
+        reverse=True
+    )
+    source_file = media_files[0]
+
+    clean_title = youtube_safe_filename(title)
+    start_name = youtube_format_time(start_seconds).replace(":", "-")
+    end_name = youtube_format_time(end_seconds).replace(":", "-")
+
+    final_name = (
+        f"{clean_title}_{start_name}_{end_name}.mp4"
+    )
+    final_path = Path(OUTPUT_DIR) / final_name
+
+    if source_file.suffix.lower() == ".mp4":
+        if final_path.exists():
+            final_path.unlink()
+        shutil.move(str(source_file), str(final_path))
+    else:
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i", str(source_file),
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "20",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(final_path),
+        ]
+
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "FFmpeg conversion failed:\n\n"
+                + result.stderr[-5000:]
+            )
+
+        source_file.unlink(missing_ok=True)
+
+    if not final_path.exists():
+        raise RuntimeError("Final MP4 was not created.")
+
+    return str(final_path)
+
+
+# =====================================================================
 # UNIVERSAL VIDEO STREAM TRIMMER (ZERO DATACENTER 403 ISSUES)
 # =====================================================================
 def cut_universal_video(source_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
@@ -608,6 +823,179 @@ with col_main:
                                     key=f"dl_{fname}"
                                 )
                         st.write("---")
+
+    elif tool_info["type"] == "youtube_clip":
+        st.markdown("#### YouTube Clip Downloader")
+        st.caption(
+            "Use this with videos you own or are authorized to download and process."
+        )
+
+        youtube_url = st.text_input(
+            "YouTube URL:",
+            placeholder="https://www.youtube.com/watch?v=..."
+        )
+
+        info_key = "youtube_video_info"
+
+        if st.button("🔎 Get Video Information", use_container_width=True):
+            if not youtube_url.strip():
+                st.warning("Please provide a YouTube URL.")
+            else:
+                try:
+                    with st.spinner("Reading video information..."):
+                        info = get_youtube_video_info(youtube_url.strip())
+                    st.session_state[info_key] = info
+                except Exception as e:
+                    st.error(f"Could not read the video: {e}")
+
+        youtube_info = st.session_state.get(info_key)
+
+        if youtube_info:
+            youtube_title = youtube_info.get("title", "YouTube Video")
+            youtube_duration = youtube_info.get("duration")
+            youtube_thumbnail = youtube_info.get("thumbnail")
+
+            st.subheader(youtube_title)
+
+            if youtube_thumbnail:
+                st.image(youtube_thumbnail, use_container_width=True)
+
+            if youtube_duration:
+                st.info(
+                    "Video duration: "
+                    + youtube_format_time(youtube_duration)
+                )
+
+        col_yt1, col_yt2 = st.columns(2)
+
+        with col_yt1:
+            youtube_start = st.text_input(
+                "Start Timestamp (HH:MM:SS or MM:SS):",
+                value="00:00:00",
+                key="youtube_start_time"
+            )
+
+        with col_yt2:
+            youtube_end = st.text_input(
+                "End Timestamp (HH:MM:SS or MM:SS):",
+                value="00:00:30",
+                key="youtube_end_time"
+            )
+
+        youtube_quality = st.selectbox(
+            "Maximum Video Quality:",
+            list(YOUTUBE_QUALITY_OPTIONS.keys()),
+            index=2,
+            key="youtube_quality"
+        )
+
+        st.caption(
+            "If the selected resolution is unavailable, yt-dlp will use "
+            "the highest compatible resolution it can obtain up to the selected limit."
+        )
+
+        youtube_clip_btn = st.button(
+            "🎬 Create YouTube Clip",
+            type="primary",
+            use_container_width=True
+        )
+
+        if youtube_clip_btn:
+            if not youtube_url.strip():
+                st.warning("Please provide a YouTube URL.")
+            else:
+                try:
+                    start_sec = youtube_time_to_seconds(youtube_start)
+                    end_sec = youtube_time_to_seconds(youtube_end)
+
+                    if start_sec < 0:
+                        raise ValueError("Start time cannot be negative.")
+
+                    if end_sec <= start_sec:
+                        raise ValueError(
+                            "End time must be greater than start time."
+                        )
+
+                    if youtube_info:
+                        duration = youtube_info.get("duration")
+                        if duration and end_sec > duration:
+                            raise ValueError(
+                                "The end time is longer than the video."
+                            )
+
+                    with st.spinner("Preparing the YouTube clip..."):
+                        if youtube_info:
+                            title = youtube_info.get(
+                                "title",
+                                "YouTube Clip"
+                            )
+                        else:
+                            youtube_info = get_youtube_video_info(
+                                youtube_url.strip()
+                            )
+                            st.session_state[info_key] = youtube_info
+                            title = youtube_info.get(
+                                "title",
+                                "YouTube Clip"
+                            )
+
+                    temp_directory = tempfile.mkdtemp(
+                        prefix="youtube_clip_"
+                    )
+
+                    try:
+                        t0 = time.time()
+
+                        with st.spinner(
+                            f"Creating {youtube_quality} clip "
+                            f"from {youtube_start} to {youtube_end}..."
+                        ):
+                            output_file = download_youtube_clip(
+                                url=youtube_url.strip(),
+                                start_seconds=start_sec,
+                                end_seconds=end_sec,
+                                quality=youtube_quality,
+                                output_directory=temp_directory,
+                                title=title,
+                            )
+
+                        elapsed = time.time() - t0
+
+                        st.success(
+                            f"✓ YouTube clip created: "
+                            f"`{os.path.basename(output_file)}` "
+                            f"({youtube_format_time(end_sec - start_sec)} "
+                            f"in {elapsed:.1f}s)"
+                        )
+
+                        st.video(output_file)
+
+                        with open(output_file, "rb") as vf:
+                            st.download_button(
+                                label="⬇️ Download YouTube Clip to PC",
+                                data=vf.read(),
+                                file_name=os.path.basename(output_file),
+                                mime="video/mp4",
+                                type="primary",
+                                use_container_width=True
+                            )
+
+                    finally:
+                        shutil.rmtree(
+                            temp_directory,
+                            ignore_errors=True
+                        )
+
+                except Exception as e:
+                    st.error(
+                        f"✖ YouTube clipping failed: {e}"
+                    )
+
+        st.divider()
+        st.caption(
+            "YouTube downloads depend on the source, available formats, "
+            "and the environment running the app."
+        )
 
     elif tool_info["type"] == "universal_trim":
         st.markdown("#### Direct Video Stream Trimmer")
