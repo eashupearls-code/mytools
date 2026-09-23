@@ -3,15 +3,15 @@ import re
 import time
 import zipfile
 import io
-import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # =====================================================================
-# CONFIGURATION & API KEYS (STREAMLIT SECRETS VAULT + LOCAL FALLBACKS)
+# CONFIGURATION & SECRETS
 # =====================================================================
 def get_secret(key: str, default: str = "") -> str:
-    """Safely retrieves keys from Streamlit Secrets, environment, or default."""
     try:
         if key in st.secrets:
             return str(st.secrets[key]).strip()
@@ -29,14 +29,14 @@ OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MAX_VIDEO_SIZE_MB = 100.0
-MIN_IMAGE_SIZE_KB = 100.0   # Quality floor: 100 KB
-MAX_IMAGE_SIZE_MB = 10.0    # Quality cap: 10 MB
+MIN_IMAGE_SIZE_KB = 100.0
+MAX_IMAGE_SIZE_MB = 10.0
 
 GLOBAL_USER_AGENT = "BrollStudioAutomation/1.0 (documentary_research_tool; contact@studio.local)"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between"}
 
 # =====================================================================
-# TOOL METADATA & DESCRIPTIONS
+# TOOL METADATA & REPOSITORIES
 # =====================================================================
 TOOLS = {
     "Stock Video Footage": {
@@ -81,11 +81,11 @@ TOOLS = {
         "type": "search",
         "auth_key": "UNSPLASH_ACCESS_KEY"
     },
-    "Universal Video Trimmer": {
-        "tag": "universal_clip",
+    "YouTube Precision Cutter": {
+        "tag": "youtube_clip",
         "ext": "mp4",
-        "desc": "Extracts precise 5s to 60s silent B-roll segments from any direct video link (Google Drive, Archive.org, Dropbox, or MP4 URLs).",
-        "type": "universal_trim",
+        "desc": "Direct client-side YouTube clipper: trims exact timestamp segments directly to your computer without cloud datacenter restrictions.",
+        "type": "browser_cutter",
         "auth_key": None
     },
     "NASA Science & Earth": {
@@ -112,7 +112,7 @@ TOOLS = {
 }
 
 # =====================================================================
-# FILENAME SANITIZATION & QUERY ENGINE
+# QUERY ENGINE & SANITIZATION
 # =====================================================================
 def prompt_to_clean_filename(prompt: str, ext: str, max_chars: int = 50) -> str:
     clean = re.sub(r'[\\/*?:"<>|]', "", prompt)
@@ -167,11 +167,11 @@ def download_stream(url: str, output_path: str, max_size_mb: float = MAX_VIDEO_S
 
 
 # =====================================================================
-# MEDIA DOWNLOAD ENGINES
+# API ENGINES (RETURN DIRECT CDN URL + DOWNLOAD STREAM)
 # =====================================================================
-def fetch_stock_video(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_stock_video(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
-        return False, "PEXELS_API_KEY missing from secrets/environment"
+        return False, "PEXELS_API_KEY missing from secrets", None
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "landscape", "size": "large", "per_page": 5}
@@ -179,19 +179,21 @@ def fetch_stock_video(query: str, out_path: str) -> tuple[bool, str]:
         r = requests.get(url, headers=headers, params=params, timeout=15)
         videos = r.json().get("videos", [])
         if not videos:
-            return False, "No matching clips found"
+            return False, "No matching clips found", None
         files = videos[0].get("video_files", [])
         stream = next((s for s in files if s.get("height") == 1080 or s.get("width") == 1920), files[0] if files else None)
         if not stream:
-            return False, "No valid video stream"
-        return download_stream(stream["link"], out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+            return False, "No valid video stream", None
+        cdn_url = stream["link"]
+        ok, msg = download_stream(cdn_url, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+        return ok, msg, cdn_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
-        return False, "PEXELS_API_KEY missing from secrets/environment"
+        return False, "PEXELS_API_KEY missing from secrets", None
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "landscape", "per_page": 5}
@@ -199,59 +201,59 @@ def fetch_stock_photo(query: str, out_path: str) -> tuple[bool, str]:
         r = requests.get(url, headers=headers, params=params, timeout=15)
         photos = r.json().get("photos", [])
         if not photos:
-            return False, "No photos found"
+            return False, "No photos found", None
         src = photos[0].get("src", {})
-
         img_url = src.get("original") or src.get("large2x")
-        success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
-
-        if not success and src.get("large2x") and img_url != src.get("large2x"):
+        ok, msg = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        if not ok and src.get("large2x") and img_url != src.get("large2x"):
             img_url = src.get("large2x")
-            success, detail = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
-
-        return success, detail
+            ok, msg = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_pixabay_video(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_pixabay_video(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not PIXABAY_API_KEY:
-        return False, "PIXABAY_API_KEY missing from secrets/environment"
+        return False, "PIXABAY_API_KEY missing from secrets", None
     url = "https://pixabay.com/api/videos/"
     params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 5}
     try:
         r = requests.get(url, params=params, timeout=15)
         hits = r.json().get("hits", [])
         if not hits:
-            return False, "No clips found"
+            return False, "No clips found", None
         streams = hits[0].get("videos", {})
         chosen = streams.get("large") or streams.get("medium") or streams.get("small")
         if not chosen or not chosen.get("url"):
-            return False, "No downloadable stream"
-        return download_stream(chosen["url"], out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+            return False, "No downloadable stream", None
+        cdn_url = chosen["url"]
+        ok, msg = download_stream(cdn_url, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+        return ok, msg, cdn_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_pixabay_photo(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_pixabay_photo(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not PIXABAY_API_KEY:
-        return False, "PIXABAY_API_KEY missing from secrets/environment"
+        return False, "PIXABAY_API_KEY missing from secrets", None
     url = "https://pixabay.com/api/"
     params = {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo", "orientation": "horizontal", "per_page": 5}
     try:
         r = requests.get(url, params=params, timeout=15)
         hits = r.json().get("hits", [])
         if not hits:
-            return False, "No photos found"
+            return False, "No photos found", None
         img_url = hits[0].get("largeImageURL") or hits[0].get("imageURL")
-        return download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        ok, msg = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_coverr_video(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_coverr_video(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not COVERR_API_KEY:
-        return False, "COVERR_API_KEY missing from secrets/environment"
+        return False, "COVERR_API_KEY missing from secrets", None
     url = "https://api.coverr.co/videos"
     headers = {"Authorization": f"Bearer {COVERR_API_KEY}"}
     params = {"query": query, "urls": "true", "page_size": 5}
@@ -259,17 +261,18 @@ def fetch_coverr_video(query: str, out_path: str) -> tuple[bool, str]:
         r = requests.get(url, headers=headers, params=params, timeout=15)
         hits = r.json().get("hits") or r.json().get("videos") or []
         if not hits:
-            return False, "No Coverr video found"
+            return False, "No Coverr video found", None
         urls_obj = hits[0].get("urls", {})
         v_url = urls_obj.get("mp4_download") or urls_obj.get("mp4")
-        return download_stream(v_url, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+        ok, msg = download_stream(v_url, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+        return ok, msg, v_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_unsplash_photo(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_unsplash_photo(query: str, out_path: str) -> tuple[bool, str, str | None]:
     if not UNSPLASH_ACCESS_KEY:
-        return False, "UNSPLASH_ACCESS_KEY missing from secrets/environment"
+        return False, "UNSPLASH_ACCESS_KEY missing from secrets", None
     url = "https://api.unsplash.com/search/photos"
     headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
     params = {"query": query, "orientation": "landscape", "per_page": 5}
@@ -277,21 +280,22 @@ def fetch_unsplash_photo(query: str, out_path: str) -> tuple[bool, str]:
         r = requests.get(url, headers=headers, params=params, timeout=15)
         results = r.json().get("results", [])
         if not results:
-            return False, "No photos found"
+            return False, "No photos found", None
         img_url = results[0]["urls"].get("full") or results[0]["urls"].get("regular")
-        return download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        ok, msg = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_nasa_broll(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_nasa_broll(query: str, out_path: str) -> tuple[bool, str, str | None]:
     url = "https://images-api.nasa.gov/search"
     params = {"q": query, "media_type": "video"}
     try:
         r = requests.get(url, params=params, timeout=15)
         items = r.json().get("collection", {}).get("items", [])
         if not items:
-            return False, "No NASA records found"
+            return False, "No NASA records found", None
         for item in items[:3]:
             manifest = item.get("href")
             if not manifest:
@@ -302,13 +306,14 @@ def fetch_nasa_broll(query: str, out_path: str) -> tuple[bool, str]:
             mp4s = [u for u in m_res.json() if u.endswith(".mp4")]
             chosen = next((u for u in mp4s if "~1080p.mp4" in u or "1080p" in u), mp4s[0] if mp4s else None)
             if chosen:
-                return download_stream(chosen, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
-        return False, "No downloadable MP4 asset found"
+                ok, msg = download_stream(chosen, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+                return ok, msg, chosen
+        return False, "No downloadable MP4 asset found", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_wikimedia_image(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_wikimedia_image(query: str, out_path: str) -> tuple[bool, str, str | None]:
     url = "https://commons.wikimedia.org/w/api.php"
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     params = {
@@ -329,13 +334,14 @@ def fetch_wikimedia_image(query: str, out_path: str) -> tuple[bool, str]:
             info = (page.get("imageinfo") or [{}])[0]
             img_url = info.get("thumburl") or info.get("url")
             if img_url:
-                return download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
-        return False, "No archival stills found"
+                ok, msg = download_stream(img_url, out_path, max_size_mb=MAX_IMAGE_SIZE_MB, min_size_kb=MIN_IMAGE_SIZE_KB)
+                return ok, msg, img_url
+        return False, "No archival stills found", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_loc_broll(query: str, out_path: str) -> tuple[bool, str]:
+def fetch_loc_broll(query: str, out_path: str) -> tuple[bool, str, str | None]:
     url = "https://www.loc.gov/film-and-videos/"
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     words = [w for w in query.split() if len(w) > 2]
@@ -354,70 +360,39 @@ def fetch_loc_broll(query: str, out_path: str) -> tuple[bool, str]:
                 for grp in res.get("files", []):
                     for f in grp:
                         if f.get("url", "").endswith(".mp4"):
-                            return download_stream(f["url"], out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
-        return False, "No progressive MP4 found"
+                            cdn_url = f["url"]
+                            ok, msg = download_stream(cdn_url, out_path, max_size_mb=MAX_VIDEO_SIZE_MB)
+                            return ok, msg, cdn_url
+        return False, "No progressive MP4 found", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def time_to_sec(t_str: str) -> float | None:
-    parts = t_str.strip().split(":")
-    try:
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-        elif len(parts) == 3:
-            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-    except ValueError:
-        return None
-    return None
+# Worker function for parallel multi-threading
+def process_single_prompt(prompt: str, tool_name: str, ext: str):
+    filename = prompt_to_clean_filename(prompt, ext)
+    out_path = os.path.join(OUTPUT_DIR, filename)
+    primary_q, fallback_q = get_search_queries(prompt)
+    fetch_func = ENGINE_DISPATCH[tool_name]
+    
+    t0 = time.time()
+    ok, detail, cdn_url = fetch_func(primary_q, out_path)
+    if not ok and fallback_q and fallback_q != primary_q:
+        ok, detail, cdn_url = fetch_func(fallback_q, out_path)
+    elapsed = time.time() - t0
+    
+    return {
+        "prompt": prompt,
+        "filename": filename,
+        "path": out_path,
+        "ext": ext,
+        "ok": ok,
+        "detail": detail,
+        "cdn_url": cdn_url,
+        "elapsed": elapsed
+    }
 
 
-# =====================================================================
-# UNIVERSAL VIDEO STREAM TRIMMER (ZERO DATACENTER 403 ISSUES)
-# =====================================================================
-def cut_universal_video(source_url: str, start_str: str, end_str: str, out_path: str) -> tuple[bool, str]:
-    s_sec = time_to_sec(start_str)
-    e_sec = time_to_sec(end_str)
-    if s_sec is None or e_sec is None:
-        return False, "Invalid time format (Use MM:SS)"
-    duration = e_sec - s_sec
-    if duration < 5.0 or duration > 60.0:
-        return False, f"Duration must be between 5s and 60s (Requested: {duration:.1f}s)"
-
-    # Convert common cloud share links (Dropbox/Google Drive) to direct download streams
-    clean_url = source_url.strip()
-    if "dropbox.com" in clean_url and "dl=0" in clean_url:
-        clean_url = clean_url.replace("dl=0", "dl=1")
-    elif "drive.google.com/file/d/" in clean_url:
-        file_id = clean_url.split("/d/")[1].split("/")[0]
-        clean_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", str(s_sec),
-        "-i", clean_url,
-        "-t", str(duration),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "22",
-        "-an",
-        "-movflags", "+faststart",
-        out_path
-    ]
-
-    try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            sz = os.path.getsize(out_path) / (1024 * 1024)
-            return True, f"{sz:.1f} MB (Silent B-roll)"
-        return False, "Trimming produced an empty file"
-    except Exception as e:
-        return False, f"Video trimming error: {e}"
-
-
-# =====================================================================
-# FAST ZERO-COMPRESSION ZIP BUNDLER
-# =====================================================================
 def create_zip_bytes(file_list: list[str]) -> bytes:
     mem_zip = io.BytesIO()
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
@@ -441,7 +416,7 @@ ENGINE_DISPATCH = {
 }
 
 # =====================================================================
-# STREAMLIT UI SETUP
+# STREAMLIT UI SETUP & STYLING
 # =====================================================================
 st.set_page_config(page_title="Automation Tools By Shoaib Malik", page_icon="🎬", layout="wide")
 
@@ -492,6 +467,14 @@ if not st.session_state.authenticated:
 
     st.stop()
 
+# Initialize session caches for download persistence
+if "batch_results" not in st.session_state:
+    st.session_state.batch_results = []
+if "batch_zip_data" not in st.session_state:
+    st.session_state.batch_zip_data = None
+if "last_tool_used" not in st.session_state:
+    st.session_state.last_tool_used = ""
+
 # =====================================================================
 # AUTHENTICATED WORKSPACE
 # =====================================================================
@@ -503,6 +486,8 @@ with col_logout:
     st.write("")
     if st.button("🔒 Log Out", use_container_width=True):
         st.session_state.authenticated = False
+        st.session_state.batch_results = []
+        st.session_state.batch_zip_data = None
         st.rerun()
 
 st.divider()
@@ -519,6 +504,12 @@ with col_nav:
 
 tool_info = TOOLS[selected_tool_name]
 
+# Clear prior tool cache if switching repositories
+if st.session_state.last_tool_used != selected_tool_name:
+    st.session_state.batch_results = []
+    st.session_state.batch_zip_data = None
+    st.session_state.last_tool_used = selected_tool_name
+
 with col_main:
     st.subheader(f"Tool: {selected_tool_name}")
     st.info(tool_info["desc"])
@@ -532,129 +523,117 @@ with col_main:
     if tool_info["type"] == "search":
         prompt_input = st.text_area(
             "Paste Visual Prompts (one prompt per line):",
-            height=180,
-            placeholder="geologist holding rock sample\nmountain peak sunrise landscape\nancient roman architecture"
+            height=160,
+            placeholder="cinematic drone flight over misty mountains\nbusy neon city street night traffic\nmodern corporate boardroom meeting"
         )
-        start_btn = st.button(f"Start Sourcing ({selected_tool_name})", type="primary")
+        
+        col_btn1, col_btn2 = st.columns([1.2, 1])
+        with col_btn1:
+            start_btn = st.button(f"⚡ Start Fast Parallel Sourcing", type="primary", use_container_width=True)
+        with col_btn2:
+            if st.session_state.batch_results:
+                if st.button("Clear Results", use_container_width=True):
+                    st.session_state.batch_results = []
+                    st.session_state.batch_zip_data = None
+                    st.rerun()
 
         if start_btn:
             lines = [line.strip() for line in prompt_input.splitlines() if line.strip()]
             if not lines:
-                st.warning("Please enter at least one prompt before starting.")
+                st.warning("Please enter at least one visual prompt.")
             else:
-                progress_bar = st.progress(0)
-                status_box = st.container()
-
-                fetch_func = ENGINE_DISPATCH[selected_tool_name]
                 ext = tool_info["ext"]
-                successful_files = []
+                st.session_state.batch_results = []
+                st.session_state.batch_zip_data = None
 
-                with status_box:
-                    st.write(f"**Fetching {len(lines)} asset(s)...**")
-                    for idx, raw_prompt in enumerate(lines):
-                        filename = prompt_to_clean_filename(raw_prompt, ext)
-                        out_path = os.path.join(OUTPUT_DIR, filename)
-
-                        primary_q, fallback_q = get_search_queries(raw_prompt)
-                        t0 = time.time()
-
-                        with st.spinner(f"[{idx+1}/{len(lines)}] Sourcing: \"{raw_prompt}\"..."):
-                            success, detail = fetch_func(primary_q, out_path)
-                            if not success and fallback_q and fallback_q != primary_q:
-                                success, detail = fetch_func(fallback_q, out_path)
-
-                        elapsed = time.time() - t0
-                        if success:
-                            st.success(f"✓ **Retrieved:** `{filename}` ({detail} in {elapsed:.1f}s)")
-                            successful_files.append((filename, out_path, ext))
-                        else:
-                            st.error(f"✖ **Failed:** \"{raw_prompt}\" — {detail}")
-
-                        progress_bar.progress((idx + 1) / len(lines))
-
-                st.balloons()
-
-                if successful_files:
-                    st.markdown("### 📥 Save Assets to Your Computer")
+                with st.spinner(f"Downloading {len(lines)} asset(s) simultaneously at datacenter speed..."):
+                    t_all = time.time()
                     
-                    zip_data = create_zip_bytes([path for _, path, _ in successful_files])
-                    st.download_button(
-                        label="⬇️ Download All Files to Computer (.ZIP)",
-                        data=zip_data,
-                        file_name="broll_assets.zip",
-                        mime="application/zip",
-                        type="primary",
-                        use_container_width=True
-                    )
+                    # Fetch all prompts in parallel
+                    with ThreadPoolExecutor(max_workers=min(len(lines), 6)) as executor:
+                        futures = [
+                            executor.submit(process_single_prompt, line, selected_tool_name, ext)
+                            for line in lines
+                        ]
+                        results = [f.result() for f in futures]
+                    
+                    st.session_state.batch_results = results
+                    
+                    # Pre-build instant ZIP once in session state
+                    valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
+                    if valid_paths:
+                        st.session_state.batch_zip_data = create_zip_bytes(valid_paths)
 
-                    st.divider()
+                st.success(f"✓ All {len(lines)} assets sourced in {time.time() - t_all:.1f}s total!")
+                st.rerun()
 
-                    st.markdown("#### Individual Asset Previews")
-                    for fname, fpath, fext in successful_files:
-                        col_preview, col_info = st.columns([1.5, 1])
-                        with col_preview:
-                            if fext == "mp4":
-                                st.video(fpath)
-                            else:
-                                st.image(fpath)
-                        with col_info:
-                            st.write(f"**File:** `{fname}`")
-                            with open(fpath, "rb") as item_f:
-                                st.download_button(
-                                    label=f"⬇️ Download {fname}",
-                                    data=item_f.read(),
-                                    file_name=fname,
-                                    mime="video/mp4" if fext == "mp4" else "image/jpeg",
-                                    key=f"dl_{fname}"
-                                )
-                        st.write("---")
+        # Render results from session state (survives clicks without reloading)
+        if st.session_state.batch_results:
+            results = st.session_state.batch_results
+            successful = [r for r in results if r["ok"]]
+            failed = [r for r in results if not r["ok"]]
 
-    elif tool_info["type"] == "universal_trim":
-        st.markdown("#### Direct Video Stream Trimmer")
-        st.caption("Paste any public `.mp4`, Archive.org, Vimeo, Google Drive, or Dropbox video link:")
-        v_url = st.text_input("Source Video URL:", placeholder="https://ia800201.us.archive.org/.../sample.mp4")
-        
-        col_t1, col_t2 = st.columns(2)
-        with col_t1:
-            start_time = st.text_input("Start Timestamp (MM:SS):", value="00:15")
-        with col_t2:
-            end_time = st.text_input("End Timestamp (MM:SS):", value="00:35")
+            for r in failed:
+                st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
 
-        custom_label = st.text_input("Target File Title (Prompt/Label):", value="documentary_broll_clip")
-        trim_btn = st.button("Extract Clip (5s to 60s)", type="primary")
+            for r in successful:
+                st.success(f"✓ **Retrieved:** `{r['filename']}` ({r['detail']} in {r['elapsed']:.1f}s)")
 
-        if trim_btn:
-            if not v_url:
-                st.warning("Please provide a valid video URL.")
-            else:
-                filename = prompt_to_clean_filename(custom_label, "mp4")
-                out_path = os.path.join(OUTPUT_DIR, filename)
-                t0 = time.time()
+            if successful and st.session_state.batch_zip_data:
+                st.markdown("### 📥 Save Assets to Your Computer")
+                
+                # Master 1-Click ZIP button (instant: data is already held in RAM)
+                st.download_button(
+                    label="⬇️ Download All Files to Computer (.ZIP)",
+                    data=st.session_state.batch_zip_data,
+                    file_name="broll_assets.zip",
+                    mime="application/zip",
+                    type="primary",
+                    use_container_width=True
+                )
 
-                with st.spinner(f"Extracting silent video segment from {start_time} to {end_time}..."):
-                    success, detail = cut_universal_video(v_url, start_time, end_time, out_path)
+                st.divider()
 
-                elapsed = time.time() - t0
-                if success:
-                    st.success(f"✓ **Saved Silent B-Roll Clip:** `{filename}` ({detail} in {elapsed:.1f}s)")
-                    st.video(out_path)
-                    with open(out_path, "rb") as vf:
-                        st.download_button(
-                            label=f"⬇️ Download {filename} to PC",
-                            data=vf.read(),
-                            file_name=filename,
-                            mime="video/mp4",
-                            type="primary",
-                            use_container_width=True
-                        )
-                else:
-                    st.error(f"✖ **Trimming Failed:** {detail}")
+                st.markdown("#### Individual Asset Previews & Direct CDN Links")
+                for r in successful:
+                    col_preview, col_info = st.columns([1.5, 1.2])
+                    with col_preview:
+                        if r["ext"] == "mp4":
+                            st.video(r["path"])
+                        else:
+                            st.image(r["path"])
+                    with col_info:
+                        st.write(f"**Prompt:** {r['prompt']}")
+                        st.write(f"**Filename:** `{r['filename']}`")
+                        
+                        # Direct CDN button: Maximum internet bandwidth straight to user
+                        if r["cdn_url"]:
+                            st.link_button(
+                                label="⚡ Instant Direct CDN Download (Fastest)",
+                                url=r["cdn_url"],
+                                use_container_width=True
+                            )
+                        
+                        with open(r["path"], "rb") as item_f:
+                            st.download_button(
+                                label=f"⬇️ Download {r['filename']} from Server",
+                                data=item_f.read(),
+                                file_name=r["filename"],
+                                mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
+                                key=f"dl_{r['filename']}",
+                                use_container_width=True
+                            )
+                    st.write("---")
+
+    elif tool_info["type"] == "browser_cutter":
+        st.markdown("#### 🎬 YouTube Precision Cutter")
+        st.caption("Paste your YouTube link below, drag the start/end handles to set your cut timestamps, and download the trimmed MP4 directly to your PC:")
+        components.iframe("https://yt-clipper.com/", height=780, scrolling=True)
 
         st.divider()
-        st.markdown("#### Need to Trim YouTube Specifically?")
-        st.write("Cloud servers (AWS) are blocked by YouTube's datacenter firewalls. Use these fast, free browser-side cutters that use your home internet IP:")
+        st.markdown("##### Alternative Precision Tools")
         c1, c2 = st.columns(2)
         with c1:
-            st.link_button("🌐 Open YT-Clipper (Timestamp Cutter)", "https://www.yt-clipper.com/", use_container_width=True)
+            st.link_button("⚡ Open Cobalt (Full MP4 Downloader)", "https://cobalt.tools/", use_container_width=True)
         with c2:
-            st.link_button("⚡ Open Cobalt (Direct Video Downloader)", "https://cobalt.tools/", use_container_width=True)
+            st.link_button("🌐 Open YT-Clipper in New Window", "https://yt-clipper.com/", use_container_width=True)
