@@ -6,6 +6,7 @@ import io
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # =====================================================================
 # CONFIGURATION & SECRETS
@@ -26,14 +27,14 @@ UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MAX_WIKIMEDIA_SIZE_MB = 10.0  # Strict 10MB limit for Wikimedia only
+MAX_WIKIMEDIA_SIZE_MB = 10.0
 UNLIMITED_MEDIA_SIZE_MB = 350.0
 
 GLOBAL_USER_AGENT = "BrollStudioArchive/2.0 (documentary_research_tool; contact@studio.local)"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between"}
 
 # =====================================================================
-# 6 CORE REPOSITORIES (PEXELS, PIXABAY, UNSPLASH, WIKIMEDIA)
+# CORE REPOSITORIES
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -135,7 +136,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
 
 
 # =====================================================================
-# DIRECT API FETCH ENGINES (FULL VIDEOS - NO TRIMMING DELAYS)
+# API ENGINES
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -193,7 +194,6 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str) -> tuple
             large = streams.get("large", {})
             if (large.get("height") or 0) >= 1440 or (large.get("width") or 0) >= 2560:
                 chosen = large
-
         elif quality_choice == "720p HD":
             medium = streams.get("medium", {})
             if (medium.get("height") or 0) == 720 or (medium.get("width") or 0) == 1280:
@@ -432,7 +432,7 @@ if "last_tool_used" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 Automation Tools By Shoaib Malik")
-    st.caption("⚡ Direct stream download | No media player overhead | Pure ZIP bundling")
+    st.caption("⚡ Direct stream sourcing | Instant multi-CDN downloads | High-speed pipeline")
 with col_logout:
     st.write("")
     if st.button("🔒 Log Out", use_container_width=True):
@@ -520,7 +520,6 @@ with col_main:
 
                 st.session_state.batch_results = results
 
-                # Pre-package ZIP directly into memory so clicking download has zero delay
                 valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
                 if valid_paths:
                     st.session_state.batch_zip_data = create_zip_bytes(valid_paths)
@@ -528,22 +527,62 @@ with col_main:
             st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
             st.rerun()
 
-    # Results view: Clean status log with instant download button (No player overhead)
+    # Results view
     if st.session_state.batch_results:
         results = st.session_state.batch_results
         successful = [r for r in results if r["ok"]]
         failed = [r for r in results if not r["ok"]]
 
-        if successful and st.session_state.batch_zip_data:
-            st.markdown("### 📥 Download Your Sourced Assets")
-            st.download_button(
-                label="⬇️ Download All Files (.ZIP)",
-                data=st.session_state.batch_zip_data,
-                file_name="broll_assets.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True
-            )
+        if successful:
+            st.markdown("### 📥 Download Options")
+
+            # Option A: Instant Direct CDN Download (0-Second Wait)
+            cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
+
+            js_code = """
+            <script>
+            function downloadAllFast() {
+                const links = """ + str(cdn_links) + """;
+                links.forEach((item, index) => {
+                    setTimeout(() => {
+                        const a = document.createElement('a');
+                        a.href = item.url;
+                        a.download = item.name;
+                        a.target = '_blank';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                    }, index * 400);
+                });
+            }
+            </script>
+            <button onclick="downloadAllFast()" style="
+                background-color: #00C853;
+                color: white;
+                border: none;
+                padding: 14px 24px;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 8px;
+                cursor: pointer;
+                width: 100%;
+                margin-bottom: 12px;
+                box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            ">
+                ⚡ Instant Parallel Download (Direct from Edge CDN - 0s Delay)
+            </button>
+            """
+            components.html(js_code, height=65)
+
+            # Option B: Traditional Bundled ZIP
+            if st.session_state.batch_zip_data:
+                st.download_button(
+                    label="📦 Download Single Bundled Archive (.ZIP)",
+                    data=st.session_state.batch_zip_data,
+                    file_name="broll_assets.zip",
+                    mime="application/zip",
+                    use_container_width=True
+                )
 
         st.divider()
         st.markdown("#### Sourced File Status")
@@ -552,4 +591,9 @@ with col_main:
             st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
 
         for r in successful:
-            st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
+            c1, c2 = st.columns([3, 1])
+            with c1:
+                st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
+            with c2:
+                if r.get("cdn_url"):
+                    st.link_button(f"⚡ Direct Link", r["cdn_url"], use_container_width=True)
