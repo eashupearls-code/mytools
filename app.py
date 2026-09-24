@@ -7,6 +7,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Locate FFmpeg
 try:
@@ -143,7 +144,6 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
 
 
 def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
-    """Slices video in ~0.3s without re-encoding to keep files small and downloads instant."""
     cmd_copy = [
         FFMPEG_EXE, "-y",
         "-ss", "00:00:00",
@@ -161,16 +161,15 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
     except Exception:
         pass
 
-    # Fallback to direct download if stream-copying fails
     return download_stream(cdn_url, output_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
 
 
 # =====================================================================
-# API ENGINES
+# API ENGINES (RETURN STATUS + DIRECT CDN URL FOR CLIENT DOWNLOAD)
 # =====================================================================
-def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str]:
+def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
-        return False, "PEXELS_API_KEY missing from secrets"
+        return False, "PEXELS_API_KEY missing from secrets", None
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "landscape", "per_page": 6}
@@ -178,7 +177,7 @@ def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seco
         r = requests.get(url, headers=headers, params=params, timeout=12)
         videos = r.json().get("videos", [])
         if not videos:
-            return False, "No matching clips found"
+            return False, "No matching clips found", None
 
         files = videos[0].get("video_files", [])
         valid_files = [f for f in files if f.get("link")]
@@ -197,22 +196,24 @@ def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seco
 
         cdn_url = chosen["link"]
         if clip_seconds:
-            return trim_video_stream(cdn_url, out_path, clip_seconds)
-        return download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+            ok, msg = trim_video_stream(cdn_url, out_path, clip_seconds)
+        else:
+            ok, msg = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        return ok, msg, cdn_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str]:
+def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str, str | None]:
     if not PIXABAY_API_KEY:
-        return False, "PIXABAY_API_KEY missing from secrets"
+        return False, "PIXABAY_API_KEY missing from secrets", None
     url = "https://pixabay.com/api/videos/"
     params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 6}
     try:
         r = requests.get(url, params=params, timeout=12)
         hits = r.json().get("hits", [])
         if not hits:
-            return False, "No clips found"
+            return False, "No clips found", None
 
         streams = hits[0].get("videos", {})
         chosen = None
@@ -230,19 +231,21 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_sec
             chosen = streams.get("large") or streams.get("medium") or streams.get("small")
 
         if not chosen or not chosen.get("url"):
-            return False, "No downloadable stream found"
+            return False, "No downloadable stream found", None
 
         cdn_url = chosen["url"]
         if clip_seconds:
-            return trim_video_stream(cdn_url, out_path, clip_seconds)
-        return download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+            ok, msg = trim_video_stream(cdn_url, out_path, clip_seconds)
+        else:
+            ok, msg = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        return ok, msg, cdn_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
+def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
-        return False, "PEXELS_API_KEY missing from secrets"
+        return False, "PEXELS_API_KEY missing from secrets", None
     url = "https://api.pexels.com/v1/search"
     headers = {"Authorization": PEXELS_API_KEY}
     params = {"query": query, "orientation": "landscape", "per_page": 5}
@@ -250,33 +253,35 @@ def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: int | None =
         r = requests.get(url, headers=headers, params=params, timeout=12)
         photos = r.json().get("photos", [])
         if not photos:
-            return False, "No photos found"
+            return False, "No photos found", None
         src = photos[0].get("src", {})
         img_url = src.get("original") or src.get("large2x") or src.get("large")
-        return download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        ok, msg = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_pixabay_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
+def fetch_pixabay_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
     if not PIXABAY_API_KEY:
-        return False, "PIXABAY_API_KEY missing from secrets"
+        return False, "PIXABAY_API_KEY missing from secrets", None
     url = "https://pixabay.com/api/"
     params = {"key": PIXABAY_API_KEY, "q": query, "image_type": "photo", "orientation": "horizontal", "per_page": 5}
     try:
         r = requests.get(url, params=params, timeout=12)
         hits = r.json().get("hits", [])
         if not hits:
-            return False, "No photos found"
+            return False, "No photos found", None
         img_url = hits[0].get("largeImageURL") or hits[0].get("imageURL")
-        return download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        ok, msg = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
+def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
     if not UNSPLASH_ACCESS_KEY:
-        return False, "UNSPLASH_ACCESS_KEY missing from secrets"
+        return False, "UNSPLASH_ACCESS_KEY missing from secrets", None
     url = "https://api.unsplash.com/search/photos"
     headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
     params = {"query": query, "orientation": "landscape", "per_page": 5}
@@ -284,14 +289,15 @@ def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: int | None
         r = requests.get(url, headers=headers, params=params, timeout=12)
         results = r.json().get("results", [])
         if not results:
-            return False, "No photos found"
+            return False, "No photos found", None
         img_url = results[0]["urls"].get("full") or results[0]["urls"].get("regular")
-        return download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        ok, msg = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
+        return ok, msg, img_url
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
-def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
+def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
     url = "https://commons.wikimedia.org/w/api.php"
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     params = {
@@ -309,7 +315,7 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | No
         r = requests.get(url, params=params, headers=headers, timeout=15)
         pages = r.json().get("query", {}).get("pages", {})
         if not pages:
-            return False, "No matching archival records found"
+            return False, "No matching archival records found", None
 
         valid_mimes = {"image/jpeg", "image/png", "image/webp"}
 
@@ -335,11 +341,11 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | No
 
             ok, detail = download_stream(chosen_url, out_path, max_size_mb=MAX_WIKIMEDIA_SIZE_MB)
             if ok:
-                return True, f"{detail} (Archival Stills <= 10MB)"
+                return True, f"{detail} (Archival Stills <= 10MB)", chosen_url
 
-        return False, "No archival image found within 10MB limit"
+        return False, "No archival image found within 10MB limit", None
     except Exception as e:
-        return False, str(e)
+        return False, str(e), None
 
 
 # =====================================================================
@@ -362,9 +368,9 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
     fetch_func = ENGINE_MAP[tool_name]
 
     t0 = time.time()
-    ok, detail = fetch_func(primary_q, out_path, quality_choice, clip_seconds)
+    ok, detail, cdn_url = fetch_func(primary_q, out_path, quality_choice, clip_seconds)
     if not ok and fallback_q and fallback_q != primary_q:
-        ok, detail = fetch_func(fallback_q, out_path, quality_choice, clip_seconds)
+        ok, detail, cdn_url = fetch_func(fallback_q, out_path, quality_choice, clip_seconds)
     elapsed = time.time() - t0
 
     return {
@@ -373,12 +379,12 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
         "path": out_path,
         "ok": ok,
         "detail": detail,
+        "cdn_url": cdn_url,
         "elapsed": elapsed
     }
 
 
 def create_in_memory_zip(file_list: list[str]) -> bytes:
-    """Pre-packages bytes directly into memory to eliminate disk read lag on click."""
     mem_zip = io.BytesIO()
     with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
         for f in file_list:
@@ -493,7 +499,6 @@ with col_main:
         if not current_key:
             st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
-    # Bold, clean controls for Video Tools
     quality_choice = "1080p Full HD"
     clip_seconds = 10
 
@@ -562,7 +567,6 @@ with col_main:
 
                 st.session_state.batch_results = results
 
-                # Pre-package ZIP directly into RAM cache so clicking download has zero delay
                 valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
                 if valid_paths:
                     st.session_state.zip_bytes = create_in_memory_zip(valid_paths)
@@ -570,25 +574,79 @@ with col_main:
             st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
             st.rerun()
 
-    # Results view: Single Master Download Action
+    # Results View: Dual Download Strategy (Sequential Multi-Download + Bundled ZIP)
     if st.session_state.batch_results:
         results = st.session_state.batch_results
         successful = [r for r in results if r["ok"]]
         failed = [r for r in results if not r["ok"]]
 
-        if successful and st.session_state.zip_bytes:
+        if successful:
             st.markdown("### **Download Your Sourced Assets**")
-            zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
 
-            # Pre-cached bytes transfer immediately upon click
-            st.download_button(
-                label=f"⬇️ **Download All Files (.ZIP) — [{zip_mb:.1f} MB Total]**",
-                data=st.session_state.zip_bytes,
-                file_name="broll_assets.zip",
-                mime="application/zip",
-                type="primary",
-                use_container_width=True
-            )
+            # Sequential One-by-One Downloader (2-second gap, NO empty tabs)
+            cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
+
+            if cdn_links:
+                js_code = """
+                <script>
+                function downloadOneByOne() {
+                    const links = """ + str(cdn_links) + """;
+                    const btn = document.getElementById('seqBtn');
+                    btn.disabled = true;
+                    btn.style.opacity = '0.6';
+                    
+                    links.forEach((item, index) => {
+                        setTimeout(() => {
+                            btn.innerText = '⚡ Downloading (' + (index + 1) + '/' + links.length + ')...';
+                            const a = document.createElement('a');
+                            a.href = item.url;
+                            a.download = item.name;
+                            // No target='_blank' ensures no new tabs are opened
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+
+                            if (index === links.length - 1) {
+                                setTimeout(() => {
+                                    btn.disabled = false;
+                                    btn.style.opacity = '1';
+                                    btn.innerText = '✓ All Files Sent to Browser Downloads!';
+                                }, 1500);
+                            }
+                        }, index * 2000); // 2-second interval prevents Chrome popup blocks
+                    });
+                }
+                </script>
+                <button id="seqBtn" onclick="downloadOneByOne()" style="
+                    background: linear-gradient(135deg, #00C853 0%, #009624 100%);
+                    color: white;
+                    border: none;
+                    padding: 14px 20px;
+                    font-size: 15px;
+                    font-weight: 700;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    width: 100%;
+                    margin-bottom: 10px;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.12);
+                    transition: all 0.2s ease;
+                ">
+                    ⚡ Download One-by-One (2s Gap - Max Regional Speed)
+                </button>
+                """
+                components.html(js_code, height=60)
+
+            # Master Pre-cached ZIP button
+            if st.session_state.zip_bytes:
+                zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
+                st.download_button(
+                    label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
+                    data=st.session_state.zip_bytes,
+                    file_name="broll_assets.zip",
+                    mime="application/zip",
+                    type="secondary",
+                    use_container_width=True
+                )
 
         st.divider()
         st.markdown("#### **Sourced File Status**")
