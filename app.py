@@ -165,7 +165,7 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
 
 
 # =====================================================================
-# API ENGINES (RETURN STATUS + DIRECT CDN URL FOR CLIENT DOWNLOAD)
+# API ENGINES
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -574,7 +574,7 @@ with col_main:
             st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
             st.rerun()
 
-    # Results View: Dual Download Strategy (Sequential Multi-Download + Bundled ZIP)
+    # Results View
     if st.session_state.batch_results:
         results = st.session_state.batch_results
         successful = [r for r in results if r["ok"]]
@@ -583,60 +583,74 @@ with col_main:
         if successful:
             st.markdown("### **Download Your Sourced Assets**")
 
-            # Sequential One-by-One Downloader (2-second gap, NO empty tabs)
+            # Sequential Multi-Downloader via Blob Conversion (Forces real downloads for Photos & Videos)
             cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
 
             if cdn_links:
                 js_code = """
                 <script>
-                function downloadOneByOne() {
+                async function downloadOneByOne() {
                     const links = """ + str(cdn_links) + """;
                     const btn = document.getElementById('seqBtn');
                     btn.disabled = true;
                     btn.style.opacity = '0.6';
-                    
-                    links.forEach((item, index) => {
-                        setTimeout(() => {
-                            btn.innerText = '⚡ Downloading (' + (index + 1) + '/' + links.length + ')...';
+
+                    for (let i = 0; i < links.length; i++) {
+                        const item = links[i];
+                        btn.innerText = '⚡ Downloading (' + (i + 1) + '/' + links.length + ')...';
+                        try {
+                            const res = await fetch(item.url);
+                            const blob = await res.blob();
+                            const blobUrl = window.URL.createObjectURL(blob);
+                            const a = document.createElement('a');
+                            a.style.display = 'none';
+                            a.href = blobUrl;
+                            a.download = item.name;
+                            document.body.appendChild(a);
+                            a.click();
+                            window.URL.revokeObjectURL(blobUrl);
+                            document.body.removeChild(a);
+                        } catch (err) {
+                            // Fallback if CORS blocks client-side fetch: open direct download stream
                             const a = document.createElement('a');
                             a.href = item.url;
                             a.download = item.name;
-                            // No target='_blank' ensures no new tabs are opened
+                            a.target = '_blank';
                             document.body.appendChild(a);
                             a.click();
                             document.body.removeChild(a);
+                        }
+                        if (i < links.length - 1) {
+                            await new Promise(r => setTimeout(r, 2000));
+                        }
+                    }
 
-                            if (index === links.length - 1) {
-                                setTimeout(() => {
-                                    btn.disabled = false;
-                                    btn.style.opacity = '1';
-                                    btn.innerText = '✓ All Files Sent to Browser Downloads!';
-                                }, 1500);
-                            }
-                        }, index * 2000); // 2-second interval prevents Chrome popup blocks
-                    });
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    btn.innerText = '✓ All Files Downloaded!';
                 }
                 </script>
-                <button id="seqBtn" onclick="downloadOneByOne()" style="
-                    background: linear-gradient(135deg, #00C853 0%, #009624 100%);
-                    color: white;
-                    border: none;
-                    padding: 14px 20px;
-                    font-size: 15px;
-                    font-weight: 700;
-                    border-radius: 8px;
-                    cursor: pointer;
-                    width: 100%;
-                    margin-bottom: 10px;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.12);
-                    transition: all 0.2s ease;
-                ">
-                    ⚡ Download One-by-One (2s Gap - Max Regional Speed)
-                </button>
+                <div style="padding: 2px 0;">
+                    <button id="seqBtn" onclick="downloadOneByOne()" style="
+                        background: linear-gradient(135deg, #00C853 0%, #009624 100%);
+                        color: white;
+                        border: none;
+                        padding: 13px 20px;
+                        font-size: 15px;
+                        font-weight: 700;
+                        border-radius: 8px;
+                        cursor: pointer;
+                        width: 100%;
+                        margin-bottom: 6px;
+                        box-shadow: 0 4px 6px rgba(0,0,0,0.12);
+                    ">
+                        ⚡ Download One-by-One (2s Gap - Max Regional Speed)
+                    </button>
+                </div>
                 """
-                components.html(js_code, height=60)
+                components.html(js_code, height=65)
 
-            # Master Pre-cached ZIP button
+            # Master ZIP Archive
             if st.session_state.zip_bytes:
                 zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
                 st.download_button(
@@ -644,7 +658,7 @@ with col_main:
                     data=st.session_state.zip_bytes,
                     file_name="broll_assets.zip",
                     mime="application/zip",
-                    type="secondary",
+                    type="primary",
                     use_container_width=True
                 )
 
