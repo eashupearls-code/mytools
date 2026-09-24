@@ -377,6 +377,7 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
         "prompt": prompt,
         "filename": filename,
         "path": out_path,
+        "ext": ext,
         "ok": ok,
         "detail": detail,
         "cdn_url": cdn_url,
@@ -583,7 +584,6 @@ with col_main:
         if successful:
             st.markdown("### **Download Your Sourced Assets**")
 
-            # Sequential Multi-Downloader via Blob Conversion (Forces real downloads for Photos & Videos)
             cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
 
             if cdn_links:
@@ -611,7 +611,6 @@ with col_main:
                             window.URL.revokeObjectURL(blobUrl);
                             document.body.removeChild(a);
                         } catch (err) {
-                            // Fallback if CORS blocks client-side fetch: open direct download stream
                             const a = document.createElement('a');
                             a.href = item.url;
                             a.download = item.name;
@@ -650,7 +649,6 @@ with col_main:
                 """
                 components.html(js_code, height=65)
 
-            # Master ZIP Archive
             if st.session_state.zip_bytes:
                 zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
                 st.download_button(
@@ -663,10 +661,23 @@ with col_main:
                 )
 
         st.divider()
-        st.markdown("#### **Sourced File Status**")
+        st.markdown("#### **Sourced File Status & Previews**")
 
         for r in failed:
             st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
 
         for r in successful:
             st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
+            col_prev, col_meta = st.columns([1.6, 1.2])
+            with col_prev:
+                if r["ext"] == "mp4" and os.path.exists(r["path"]):
+                    st.video(r["path"])
+                elif os.path.exists(r["path"]):
+                    st.image(r["path"], use_container_width=True)
+            with col_meta:
+                st.markdown(f"**Prompt:** {r['prompt']}")
+                st.markdown(f"**Filename:** `{r['filename']}`")
+                st.caption(f"File Size: {r['detail']}")
+                if r.get("cdn_url"):
+                    st.link_button("🌐 Open Source File", r["cdn_url"], use_container_width=True)
+            st.write("---")
