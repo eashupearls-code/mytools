@@ -47,7 +47,7 @@ TOOLS = {
     "Stock Video Footage (Pexels)": {
         "tag": "pexels_video",
         "ext": "mp4",
-        "desc": "Cinematic modern 1080p/4K stock video footage.",
+        "desc": "Cinematic modern stock footage from Pexels edge servers.",
         "type": "video",
         "auth_key": "PEXELS_API_KEY"
     },
@@ -142,13 +142,13 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
         return False, str(e)
 
 
-def trim_to_15s_stream(cdn_url: str, output_path: str) -> tuple[bool, str]:
-    """Slices the first 15 seconds in ~0.3s without re-encoding to keep ZIP file tiny."""
+def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tuple[bool, str]:
+    """Slices video in ~0.3s without re-encoding to keep files small and downloads instant."""
     cmd_copy = [
         FFMPEG_EXE, "-y",
         "-ss", "00:00:00",
         "-i", cdn_url,
-        "-t", "15",
+        "-t", str(duration_sec),
         "-c", "copy",
         "-movflags", "+faststart",
         output_path
@@ -157,18 +157,18 @@ def trim_to_15s_stream(cdn_url: str, output_path: str) -> tuple[bool, str]:
         subprocess.run(cmd_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
         if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             sz_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB (15s clip)"
+            return True, f"{sz_mb:.1f} MB ({duration_sec}s clip)"
     except Exception:
         pass
 
-    # Fallback to direct download if stream copy fails
+    # Fallback to direct download if stream-copying fails
     return download_stream(cdn_url, output_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
 
 
 # =====================================================================
 # API ENGINES
 # =====================================================================
-def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_mode: str) -> tuple[bool, str]:
+def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str]:
     if not PEXELS_API_KEY:
         return False, "PEXELS_API_KEY missing from secrets"
     url = "https://api.pexels.com/videos/search"
@@ -196,14 +196,14 @@ def fetch_pexels_video(query: str, out_path: str, quality_choice: str, clip_mode
             chosen = valid_files[0]
 
         cdn_url = chosen["link"]
-        if clip_mode == "15 Seconds Max (Ultra Fast 2s ZIP Download)":
-            return trim_to_15s_stream(cdn_url, out_path)
+        if clip_seconds:
+            return trim_video_stream(cdn_url, out_path, clip_seconds)
         return download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
     except Exception as e:
         return False, str(e)
 
 
-def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_mode: str) -> tuple[bool, str]:
+def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_seconds: int | None) -> tuple[bool, str]:
     if not PIXABAY_API_KEY:
         return False, "PIXABAY_API_KEY missing from secrets"
     url = "https://pixabay.com/api/videos/"
@@ -233,14 +233,14 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str, clip_mod
             return False, "No downloadable stream found"
 
         cdn_url = chosen["url"]
-        if clip_mode == "15 Seconds Max (Ultra Fast 2s ZIP Download)":
-            return trim_to_15s_stream(cdn_url, out_path)
+        if clip_seconds:
+            return trim_video_stream(cdn_url, out_path, clip_seconds)
         return download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
     except Exception as e:
         return False, str(e)
 
 
-def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: str = "") -> tuple[bool, str]:
+def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
     if not PEXELS_API_KEY:
         return False, "PEXELS_API_KEY missing from secrets"
     url = "https://api.pexels.com/v1/search"
@@ -258,7 +258,7 @@ def fetch_pexels_photo(query: str, out_path: str, _q: str = "", _c: str = "") ->
         return False, str(e)
 
 
-def fetch_pixabay_photo(query: str, out_path: str, _q: str = "", _c: str = "") -> tuple[bool, str]:
+def fetch_pixabay_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
     if not PIXABAY_API_KEY:
         return False, "PIXABAY_API_KEY missing from secrets"
     url = "https://pixabay.com/api/"
@@ -274,7 +274,7 @@ def fetch_pixabay_photo(query: str, out_path: str, _q: str = "", _c: str = "") -
         return False, str(e)
 
 
-def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: str = "") -> tuple[bool, str]:
+def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
     if not UNSPLASH_ACCESS_KEY:
         return False, "UNSPLASH_ACCESS_KEY missing from secrets"
     url = "https://api.unsplash.com/search/photos"
@@ -291,7 +291,7 @@ def fetch_unsplash_photo(query: str, out_path: str, _q: str = "", _c: str = "") 
         return False, str(e)
 
 
-def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: str = "") -> tuple[bool, str]:
+def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str]:
     url = "https://commons.wikimedia.org/w/api.php"
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     params = {
@@ -343,7 +343,7 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "", _c: str = ""
 
 
 # =====================================================================
-# PARALLEL EXECUTION & ZIP BUILDING
+# THREADED DISPATCH & MEMORY ZIP BUILDING
 # =====================================================================
 ENGINE_MAP = {
     "Stock Video Footage (Pexels)": fetch_pexels_video,
@@ -355,16 +355,16 @@ ENGINE_MAP = {
 }
 
 
-def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice: str, clip_mode: str):
+def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice: str, clip_seconds: int | None):
     filename = prompt_to_clean_filename(prompt, ext)
     out_path = os.path.join(OUTPUT_DIR, filename)
     primary_q, fallback_q = get_search_queries(prompt)
     fetch_func = ENGINE_MAP[tool_name]
 
     t0 = time.time()
-    ok, detail = fetch_func(primary_q, out_path, quality_choice, clip_mode)
+    ok, detail = fetch_func(primary_q, out_path, quality_choice, clip_seconds)
     if not ok and fallback_q and fallback_q != primary_q:
-        ok, detail = fetch_func(fallback_q, out_path, quality_choice, clip_mode)
+        ok, detail = fetch_func(fallback_q, out_path, quality_choice, clip_seconds)
     elapsed = time.time() - t0
 
     return {
@@ -377,17 +377,15 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
     }
 
 
-def build_zip_file_on_disk(file_list: list[str]) -> str:
-    """Writes the ZIP directly to disk so Streamlit transfers it immediately."""
-    zip_path = os.path.join(OUTPUT_DIR, "broll_assets.zip")
-    if os.path.exists(zip_path):
-        os.remove(zip_path)
-
-    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_STORED) as zf:
+def create_in_memory_zip(file_list: list[str]) -> bytes:
+    """Pre-packages bytes directly into memory to eliminate disk read lag on click."""
+    mem_zip = io.BytesIO()
+    with zipfile.ZipFile(mem_zip, mode="w", compression=zipfile.ZIP_STORED) as zf:
         for f in file_list:
             if os.path.exists(f):
                 zf.write(f, arcname=os.path.basename(f))
-    return zip_path
+    mem_zip.seek(0)
+    return mem_zip.read()
 
 
 # =====================================================================
@@ -399,15 +397,15 @@ st.markdown("""
 <style>
     div[data-testid="stRadio"] label p {
         font-size: 1.15rem !important;
-        font-weight: 500 !important;
+        font-weight: 600 !important;
         line-height: 1.8 !important;
     }
     div[data-testid="stRadio"] [data-baseweb="radio"] div:first-child {
         transform: scale(1.35);
         margin-right: 0.6rem !important;
     }
-    h3 {
-        font-size: 1.4rem !important;
+    h3, h4 {
+        font-weight: 700 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -419,13 +417,13 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
 if not st.session_state.authenticated:
-    st.markdown("# 🎬 Automation Tools By Shoaib Malik")
-    st.markdown("High-speed B-roll and archival pipeline for documentary editing.")
+    st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
+    st.caption("High-speed B-roll and archival pipeline for documentary editing.")
     st.divider()
 
     _, col_login, _ = st.columns([1, 1.2, 1])
     with col_login:
-        st.markdown("### 🔒 Security Verification")
+        st.markdown("### 🔒 **Security Verification**")
         st.caption("Please log in with your authorized credentials to access this tool.")
         with st.form("login_form"):
             input_username = st.text_input("Username")
@@ -445,8 +443,8 @@ if not st.session_state.authenticated:
 # Initialize session caches
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
-if "zip_disk_path" not in st.session_state:
-    st.session_state.zip_disk_path = None
+if "zip_bytes" not in st.session_state:
+    st.session_state.zip_bytes = None
 if "last_tool_used" not in st.session_state:
     st.session_state.last_tool_used = ""
 
@@ -455,14 +453,14 @@ if "last_tool_used" not in st.session_state:
 # =====================================================================
 col_header, col_logout = st.columns([4, 1])
 with col_header:
-    st.markdown("# 🎬 Automation Tools By Shoaib Malik")
-    st.caption("⚡ High-Speed Direct Batch Pipeline | No Preview Overhead | Single Master ZIP")
+    st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
+    st.caption("⚡ Direct stream sourcing | Pre-cached ZIP delivery | 10s default cuts")
 with col_logout:
     st.write("")
-    if st.button("🔒 Log Out", use_container_width=True):
+    if st.button("🔒 **Log Out**", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.batch_results = []
-        st.session_state.zip_disk_path = None
+        st.session_state.zip_bytes = None
         st.rerun()
 
 st.divider()
@@ -470,22 +468,23 @@ st.divider()
 col_nav, col_main = st.columns([1, 2.3])
 
 with col_nav:
-    st.subheader("Select Source Tool")
+    st.markdown("### **Select Source Tool**")
     selected_tool_name = st.radio(
         "Available Repositories:",
         list(TOOLS.keys()),
-        index=0
+        index=0,
+        label_visibility="collapsed"
     )
 
 tool_info = TOOLS[selected_tool_name]
 
 if st.session_state.last_tool_used != selected_tool_name:
     st.session_state.batch_results = []
-    st.session_state.zip_disk_path = None
+    st.session_state.zip_bytes = None
     st.session_state.last_tool_used = selected_tool_name
 
 with col_main:
-    st.subheader(f"Tool: {selected_tool_name}")
+    st.markdown(f"### **Tool: {selected_tool_name}**")
     st.info(tool_info["desc"])
 
     auth_key_name = tool_info.get("auth_key")
@@ -494,40 +493,52 @@ with col_main:
         if not current_key:
             st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
-    # Quality & Clip Length Controls for Video Tools
+    # Bold, clean controls for Video Tools
     quality_choice = "1080p Full HD"
-    clip_mode = "15 Seconds Max (Ultra Fast 2s ZIP Download)"
+    clip_seconds = 10
 
     if tool_info["type"] == "video":
         col_q1, col_q2 = st.columns(2)
         with col_q1:
-            clip_mode = st.selectbox(
-                "Clip Length Mode:",
-                ["15 Seconds Max (Ultra Fast 2s ZIP Download)", "Full Video Length (Larger Archive)"],
+            st.markdown("**Clip Length**")
+            clip_label = st.selectbox(
+                "Clip Length",
+                ["10 Seconds (Default)", "15 Seconds", "Full Video Length"],
                 index=0,
-                help="15s slices download in 2-3s. Full videos take 30-60s to transfer from cloud servers."
+                label_visibility="collapsed"
             )
+            if clip_label == "10 Seconds (Default)":
+                clip_seconds = 10
+            elif clip_label == "15 Seconds":
+                clip_seconds = 15
+            else:
+                clip_seconds = None
+
         with col_q2:
+            st.markdown("**Quality**")
             quality_choice = st.selectbox(
-                "Target Quality (Default: 1080p):",
+                "Quality",
                 ["1080p Full HD", "4K UHD (2160p)", "720p HD"],
-                index=0
+                index=0,
+                label_visibility="collapsed"
             )
 
+    st.markdown("**Visual Prompts (one prompt per line)**")
     prompt_input = st.text_area(
-        "Paste Visual Prompts (one prompt per line):",
+        "Visual Prompts",
         height=160,
-        placeholder="cinematic drone flight over misty mountains\nbusy neon city street night traffic\nmodern corporate boardroom meeting"
+        placeholder="cinematic drone flight over misty mountains\nbusy neon city street night traffic\nmodern corporate boardroom meeting",
+        label_visibility="collapsed"
     )
 
     col_btn1, col_btn2 = st.columns([1.3, 1])
     with col_btn1:
-        start_btn = st.button("⚡ Start Fast Parallel Sourcing", type="primary", use_container_width=True)
+        start_btn = st.button("⚡ **Start Fast Parallel Sourcing**", type="primary", use_container_width=True)
     with col_btn2:
         if st.session_state.batch_results:
-            if st.button("Clear Results", use_container_width=True):
+            if st.button("**Clear Results**", use_container_width=True):
                 st.session_state.batch_results = []
-                st.session_state.zip_disk_path = None
+                st.session_state.zip_bytes = None
                 st.rerun()
 
     if start_btn:
@@ -537,24 +548,24 @@ with col_main:
         else:
             ext = tool_info["ext"]
             st.session_state.batch_results = []
-            st.session_state.zip_disk_path = None
+            st.session_state.zip_bytes = None
 
             with st.spinner(f"Fetching {len(lines)} asset(s) simultaneously from edge servers..."):
                 t_all = time.time()
 
                 with ThreadPoolExecutor(max_workers=min(len(lines), 8)) as executor:
                     futures = [
-                        executor.submit(process_single_prompt, line, selected_tool_name, ext, quality_choice, clip_mode)
+                        executor.submit(process_single_prompt, line, selected_tool_name, ext, quality_choice, clip_seconds)
                         for line in lines
                     ]
                     results = [f.result() for f in futures]
 
                 st.session_state.batch_results = results
 
-                # Build ZIP on disk
+                # Pre-package ZIP directly into RAM cache so clicking download has zero delay
                 valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
                 if valid_paths:
-                    st.session_state.zip_disk_path = build_zip_file_on_disk(valid_paths)
+                    st.session_state.zip_bytes = create_in_memory_zip(valid_paths)
 
             st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
             st.rerun()
@@ -565,23 +576,22 @@ with col_main:
         successful = [r for r in results if r["ok"]]
         failed = [r for r in results if not r["ok"]]
 
-        if successful and st.session_state.zip_disk_path and os.path.exists(st.session_state.zip_disk_path):
-            st.markdown("### 📥 Download Your Sourced Assets")
-            zip_size_mb = os.path.getsize(st.session_state.zip_disk_path) / (1024 * 1024)
+        if successful and st.session_state.zip_bytes:
+            st.markdown("### **Download Your Sourced Assets**")
+            zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
 
-            # Single prominent ZIP download button
-            with open(st.session_state.zip_disk_path, "rb") as zf:
-                st.download_button(
-                    label=f"⬇️ Download All Files (.ZIP) — [{zip_size_mb:.1f} MB Total]",
-                    data=zf.read(),
-                    file_name="broll_assets.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True
-                )
+            # Pre-cached bytes transfer immediately upon click
+            st.download_button(
+                label=f"⬇️ **Download All Files (.ZIP) — [{zip_mb:.1f} MB Total]**",
+                data=st.session_state.zip_bytes,
+                file_name="broll_assets.zip",
+                mime="application/zip",
+                type="primary",
+                use_container_width=True
+            )
 
         st.divider()
-        st.markdown("#### Sourced File Status")
+        st.markdown("#### **Sourced File Status**")
 
         for r in failed:
             st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
