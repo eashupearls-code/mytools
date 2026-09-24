@@ -3,17 +3,9 @@ import re
 import time
 import zipfile
 import io
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
-
-# Locate FFmpeg (bundled or system)
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    FFMPEG_EXE = "ffmpeg"
 
 # =====================================================================
 # CONFIGURATION & SECRETS
@@ -34,10 +26,8 @@ UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Quality limits
-MAX_VIDEO_DURATION_SEC = 15  # Strict 15-second cap for all video clips
 MAX_WIKIMEDIA_SIZE_MB = 10.0  # Strict 10MB limit for Wikimedia only
-UNLIMITED_MEDIA_SIZE_MB = 250.0
+UNLIMITED_MEDIA_SIZE_MB = 350.0
 
 GLOBAL_USER_AGENT = "BrollStudioArchive/2.0 (documentary_research_tool; contact@studio.local)"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between"}
@@ -49,7 +39,7 @@ TOOLS = {
     "Stock Video Footage (Pexels)": {
         "tag": "pexels_video",
         "ext": "mp4",
-        "desc": "Cinematic modern 1080p/4K stock video footage trimmed automatically to 15 seconds max.",
+        "desc": "Cinematic modern 1080p/4K full-length stock video footage from Pexels edge servers.",
         "type": "video",
         "auth_key": "PEXELS_API_KEY"
     },
@@ -63,7 +53,7 @@ TOOLS = {
     "Pixabay Video Footage": {
         "tag": "pixabay_video",
         "ext": "mp4",
-        "desc": "Commercial stock video and natural scenery trimmed automatically to 15 seconds max.",
+        "desc": "Commercial stock video and natural scenery full clips hosted on fast AWS edge servers.",
         "type": "video",
         "auth_key": "PIXABAY_API_KEY"
     },
@@ -123,7 +113,7 @@ def get_search_queries(raw_prompt: str) -> tuple[str, str | None]:
 def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_MEDIA_SIZE_MB) -> tuple[bool, str]:
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=25) as r:
+        with requests.get(url, headers=headers, stream=True, timeout=30) as r:
             r.raise_for_status()
             total_bytes = int(r.headers.get("content-length", 0))
             total_mb = total_bytes / (1024 * 1024) if total_bytes else 0
@@ -132,7 +122,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
                 return False, f"Exceeded size limit ({total_mb:.1f} MB > {max_size_mb:.0f} MB)"
 
             with open(output_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
+                for chunk in r.iter_content(chunk_size=131072):
                     if chunk:
                         f.write(chunk)
 
@@ -145,56 +135,7 @@ def download_stream(url: str, output_path: str, max_size_mb: float = UNLIMITED_M
 
 
 # =====================================================================
-# FAST VIDEO SLICER (15 SECONDS MAX VIA STREAM-COPY)
-# =====================================================================
-def trim_video_to_15s(source_url: str, output_path: str) -> tuple[bool, str]:
-    """
-    Slices the first 15 seconds directly from the CDN stream in ~0.5s without re-encoding.
-    Falls back to an ultrafast transcode if keyframes don't align.
-    """
-    cmd_fast_copy = [
-        FFMPEG_EXE, "-y",
-        "-ss", "00:00:00",
-        "-i", source_url,
-        "-t", str(MAX_VIDEO_DURATION_SEC),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    try:
-        subprocess.run(cmd_fast_copy, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            sz_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB (15s clip)"
-    except Exception:
-        pass
-
-    # Fallback: ultrafast re-encode
-    cmd_transcode = [
-        FFMPEG_EXE, "-y",
-        "-ss", "00:00:00",
-        "-i", source_url,
-        "-t", str(MAX_VIDEO_DURATION_SEC),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "20",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        output_path
-    ]
-    try:
-        subprocess.run(cmd_transcode, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            sz_mb = os.path.getsize(output_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB (15s clip)"
-    except Exception as e:
-        return False, f"Trimming error: {e}"
-
-    return False, "Could not slice 15s clip"
-
-
-# =====================================================================
-# FETCH ENGINES WITH RESOLUTION SELECTION & FALLBACK
+# DIRECT API FETCH ENGINES (FULL VIDEOS - NO TRIMMING DELAYS)
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -212,27 +153,23 @@ def fetch_pexels_video(query: str, out_path: str, quality_choice: str) -> tuple[
         if not files:
             return False, "No video files found", None
 
-        # Filter valid files and sort by resolution
         valid_files = [f for f in files if f.get("link")]
         valid_files.sort(key=lambda x: (x.get("height") or 0), reverse=True)
 
         chosen = None
-        # User selected quality hierarchy with automatic fallback
         if quality_choice == "4K UHD (2160p)":
             chosen = next((f for f in valid_files if (f.get("height") or 0) >= 2160 or (f.get("width") or 0) >= 3840), None)
         elif quality_choice == "720p HD":
             chosen = next((f for f in valid_files if (f.get("height") or 0) == 720 or (f.get("width") or 0) == 1280), None)
 
-        # 1080p selection or primary fallback
         if not chosen:
             chosen = next((f for f in valid_files if (f.get("height") or 0) == 1080 or (f.get("width") or 0) == 1920), None)
 
-        # Final fallback: best available stream
         if not chosen:
             chosen = valid_files[0]
 
         cdn_url = chosen["link"]
-        ok, detail = trim_video_to_15s(cdn_url, out_path)
+        ok, detail = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, detail, cdn_url
     except Exception as e:
         return False, str(e), None
@@ -262,7 +199,6 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str) -> tuple
             if (medium.get("height") or 0) == 720 or (medium.get("width") or 0) == 1280:
                 chosen = medium
 
-        # 1080p default or fallback
         if not chosen or not chosen.get("url"):
             chosen = streams.get("large") or streams.get("medium") or streams.get("small")
 
@@ -270,7 +206,7 @@ def fetch_pixabay_video(query: str, out_path: str, quality_choice: str) -> tuple
             return False, "No downloadable stream found", None
 
         cdn_url = chosen["url"]
-        ok, detail = trim_video_to_15s(cdn_url, out_path)
+        ok, detail = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, detail, cdn_url
     except Exception as e:
         return False, str(e), None
@@ -288,7 +224,6 @@ def fetch_pexels_photo(query: str, out_path: str, _q: str = "") -> tuple[bool, s
         if not photos:
             return False, "No photos found", None
         src = photos[0].get("src", {})
-        # Pick original uncompressed; no image size restriction
         img_url = src.get("original") or src.get("large2x") or src.get("large")
         ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, detail, img_url
@@ -306,7 +241,6 @@ def fetch_pixabay_photo(query: str, out_path: str, _q: str = "") -> tuple[bool, 
         hits = r.json().get("hits", [])
         if not hits:
             return False, "No photos found", None
-        # No size restriction
         img_url = hits[0].get("largeImageURL") or hits[0].get("imageURL")
         ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, detail, img_url
@@ -325,7 +259,6 @@ def fetch_unsplash_photo(query: str, out_path: str, _q: str = "") -> tuple[bool,
         results = r.json().get("results", [])
         if not results:
             return False, "No photos found", None
-        # Highest resolution; no size restriction
         img_url = results[0]["urls"].get("full") or results[0]["urls"].get("regular")
         ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
         return ok, detail, img_url
@@ -334,12 +267,6 @@ def fetch_unsplash_photo(query: str, out_path: str, _q: str = "") -> tuple[bool,
 
 
 def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "") -> tuple[bool, str, str | None]:
-    """
-    Fixed Wikimedia Engine:
-    - Filters out non-image files (PDF, SVG, audio, DjVu).
-    - Traverses top 10 search results to pick authentic archival photos/illustrations.
-    - Strictly enforces maximum 10MB limit using resized thumbnail fallback if raw scan is too large.
-    """
     url = "https://commons.wikimedia.org/w/api.php"
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     params = {
@@ -351,7 +278,7 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "") -> tuple[boo
         "gsrlimit": "10",
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
-        "iiurlwidth": "2560"  # High-res 2.5K width fallback
+        "iiurlwidth": "2560"
     }
     try:
         r = requests.get(url, params=params, headers=headers, timeout=15)
@@ -359,7 +286,6 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "") -> tuple[boo
         if not pages:
             return False, "No matching archival records found", None
 
-        # Filter strictly for valid web-compatible image formats
         valid_mimes = {"image/jpeg", "image/png", "image/webp"}
 
         for _, page in pages.items():
@@ -377,13 +303,12 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "") -> tuple[boo
             raw_bytes = info.get("size", 0)
             raw_mb = raw_bytes / (1024 * 1024)
 
-            # Enforce strict 10MB limit
             chosen_url = raw_url
             if raw_mb > MAX_WIKIMEDIA_SIZE_MB:
                 if thumb_url:
                     chosen_url = thumb_url
                 else:
-                    continue  # Skip files over 10MB that have no resized thumbnail
+                    continue
 
             ok, detail = download_stream(chosen_url, out_path, max_size_mb=MAX_WIKIMEDIA_SIZE_MB)
             if ok:
@@ -395,7 +320,7 @@ def fetch_wikimedia_stills(query: str, out_path: str, _q: str = "") -> tuple[boo
 
 
 # =====================================================================
-# THREADED WORKER DISPATCH
+# PARALLEL THREAD DISPATCH
 # =====================================================================
 ENGINE_MAP = {
     "Stock Video Footage (Pexels)": fetch_pexels_video,
@@ -442,7 +367,7 @@ def create_zip_bytes(file_list: list[str]) -> bytes:
 
 
 # =====================================================================
-# STREAMLIT UI SETUP & STYLING
+# STREAMLIT UI SETUP
 # =====================================================================
 st.set_page_config(page_title="Automation Tools By Shoaib Malik", page_icon="🎬", layout="wide")
 
@@ -507,7 +432,7 @@ if "last_tool_used" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 Automation Tools By Shoaib Malik")
-    st.caption("⚡ Fast parallel downloading | 15s Max Video Slices | Unrestricted High-Res Images (Wikimedia ≤ 10MB)")
+    st.caption("⚡ Direct stream download | No media player overhead | Pure ZIP bundling")
 with col_logout:
     st.write("")
     if st.button("🔒 Log Out", use_container_width=True):
@@ -530,7 +455,6 @@ with col_nav:
 
 tool_info = TOOLS[selected_tool_name]
 
-# Reset batch cache if user switches repository
 if st.session_state.last_tool_used != selected_tool_name:
     st.session_state.batch_results = []
     st.session_state.batch_zip_data = None
@@ -546,7 +470,6 @@ with col_main:
         if not current_key:
             st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
-    # Quality selector for video tools (Default: 1080p Full HD)
     quality_choice = "1080p Full HD"
     if tool_info["type"] == "video":
         col_q1, col_q2 = st.columns([1.5, 1])
@@ -558,7 +481,7 @@ with col_main:
             )
         with col_q2:
             st.write("")
-            st.caption("ℹ️ *Auto-fallback active: If your chosen resolution isn't available, the next best quality is downloaded automatically.*")
+            st.caption("ℹ️ *Auto-fallback: If selected quality is not hosted, the next highest available resolution is fetched.*")
 
     prompt_input = st.text_area(
         "Paste Visual Prompts (one prompt per line):",
@@ -585,10 +508,9 @@ with col_main:
             st.session_state.batch_results = []
             st.session_state.batch_zip_data = None
 
-            with st.spinner(f"Downloading {len(lines)} asset(s) simultaneously..."):
+            with st.spinner(f"Fetching {len(lines)} asset(s) directly from edge servers..."):
                 t_all = time.time()
 
-                # Multi-threaded concurrent execution
                 with ThreadPoolExecutor(max_workers=min(len(lines), 8)) as executor:
                     futures = [
                         executor.submit(process_single_prompt, line, selected_tool_name, ext, quality_choice)
@@ -598,32 +520,24 @@ with col_main:
 
                 st.session_state.batch_results = results
 
-                # Pre-build instant ZIP in memory
+                # Pre-package ZIP directly into memory so clicking download has zero delay
                 valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
                 if valid_paths:
                     st.session_state.batch_zip_data = create_zip_bytes(valid_paths)
 
-            st.success(f"✓ Completed {len(lines)} item(s) in {time.time() - t_all:.1f}s total!")
+            st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
             st.rerun()
 
-    # Render results from persistent session state (instant click response)
+    # Results view: Clean status log with instant download button (No player overhead)
     if st.session_state.batch_results:
         results = st.session_state.batch_results
         successful = [r for r in results if r["ok"]]
         failed = [r for r in results if not r["ok"]]
 
-        for r in failed:
-            st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
-
-        for r in successful:
-            st.success(f"✓ **Retrieved:** `{r['filename']}` ({r['detail']} in {r['elapsed']:.1f}s)")
-
         if successful and st.session_state.batch_zip_data:
-            st.markdown("### 📥 Save Assets to Your Computer")
-
-            # Master instant 1-Click ZIP button
+            st.markdown("### 📥 Download Your Sourced Assets")
             st.download_button(
-                label="⬇️ Download All Files to Computer (.ZIP)",
+                label="⬇️ Download All Files (.ZIP)",
                 data=st.session_state.batch_zip_data,
                 file_name="broll_assets.zip",
                 mime="application/zip",
@@ -631,34 +545,11 @@ with col_main:
                 use_container_width=True
             )
 
-            st.divider()
+        st.divider()
+        st.markdown("#### Sourced File Status")
 
-            st.markdown("#### Individual Asset Previews & Direct CDN Links")
-            for r in successful:
-                col_preview, col_info = st.columns([1.5, 1.2])
-                with col_preview:
-                    if r["ext"] == "mp4":
-                        st.video(r["path"])
-                    else:
-                        st.image(r["path"])
-                with col_info:
-                    st.write(f"**Prompt:** {r['prompt']}")
-                    st.write(f"**Filename:** `{r['filename']}`")
+        for r in failed:
+            st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
 
-                    if r["cdn_url"]:
-                        st.link_button(
-                            label="⚡ Instant Direct CDN Download",
-                            url=r["cdn_url"],
-                            use_container_width=True
-                        )
-
-                    with open(r["path"], "rb") as item_f:
-                        st.download_button(
-                            label=f"⬇️ Download {r['filename']}",
-                            data=item_f.read(),
-                            file_name=r["filename"],
-                            mime="video/mp4" if r["ext"] == "mp4" else "image/jpeg",
-                            key=f"dl_{r['filename']}",
-                            use_container_width=True
-                        )
-                st.write("---")
+        for r in successful:
+            st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
