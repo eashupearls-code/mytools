@@ -8,7 +8,6 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
-import yt_dlp
 
 # Locate FFmpeg
 try:
@@ -16,12 +15,6 @@ try:
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_EXE = "ffmpeg"
-
-# Optional fast transcript library
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-except ImportError:
-    YouTubeTranscriptApi = None
 
 # =====================================================================
 # CONFIGURATION & SECRETS
@@ -38,7 +31,6 @@ def get_secret(key: str, default: str = "") -> str:
 PEXELS_API_KEY = get_secret("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = get_secret("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
-FLICKR_API_KEY = get_secret("FLICKR_API_KEY", "")
 
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -46,7 +38,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_WIKIMEDIA_SIZE_MB = 10.0
 UNLIMITED_MEDIA_SIZE_MB = 350.0
 
-GLOBAL_USER_AGENT = "BrollStudioArchive/3.0 (documentary_research_tool; contact@studio.local)"
+GLOBAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 GRAMMAR_FILLERS = {"a", "an", "the", "and", "or", "of", "in", "on", "at", "to", "for", "with", "between", "from", "by"}
 ARCHIVAL_MODIFIERS = {
     "cinematic", "drone", "4k", "hd", "1080p", "720p", "slow motion", "timelapse",
@@ -56,7 +48,7 @@ ARCHIVAL_MODIFIERS = {
 }
 
 # =====================================================================
-# REPOSITORIES & SPECIALIZATIONS
+# REPOSITORIES & TOOLS (DOWNLOADERS EXCLUDED)
 # =====================================================================
 TOOLS = {
     "Stock Video Footage (Pexels)": {
@@ -123,58 +115,190 @@ TOOLS = {
         "auth_key": None,
         "archival": True
     },
-    "National Archives (NARA Historical Footage)": {
-        "tag": "nara_video",
-        "ext": "mp4",
-        "desc": "Famous for: Declassified US military operations (WWII, Korea, Vietnam), NASA Apollo space missions, and historical newsreels.",
-        "type": "video",
-        "auth_key": None,
-        "archival": True
-    },
-    "National Archives (NARA Historical Stills)": {
-        "tag": "nara_photo",
+    "iStock Photo Explorer (Search & Copy URL)": {
+        "tag": "istock_search",
         "ext": "jpg",
-        "desc": "Famous for: Official US government records, WWII wartime posters, military photography, Documerica project, and presidential libraries.",
-        "type": "photo",
+        "desc": "Search live iStock catalog by prompt, preview top 3 matches in a single row, and copy official URLs with 1-click.",
+        "type": "catalog_explorer",
+        "source": "istock",
         "auth_key": None,
-        "archival": True
+        "archival": False
     },
-    "Internet Archive (Prelinger & Historic Video)": {
-        "tag": "ia_video",
-        "ext": "mp4",
-        "desc": "Famous for: 60,000+ Prelinger Archives educational/industrial films (1927–1987), vintage commercials, public domain movies, and retro B-roll.",
-        "type": "video",
-        "auth_key": None,
-        "archival": True
-    },
-    "Internet Archive (Vintage Stills & Scans)": {
-        "tag": "ia_photo",
+    "Shutterstock Photo Explorer (Search & Copy URL)": {
+        "tag": "shutterstock_search",
         "ext": "jpg",
-        "desc": "Famous for: Rare antique book illustrations, retro advertising prints, vintage magazine scans, NASA photography, and historical art.",
-        "type": "photo",
-        "auth_key": None,
-        "archival": True
-    },
-    "Flickr Commons (Global Cultural Heritage)": {
-        "tag": "flickr_commons",
-        "ext": "jpg",
-        "desc": "Famous for: Public photography contributed by 100+ global institutions (Smithsonian, British Library, State Library of NSW) documenting 19th & 20th-century world culture.",
-        "type": "photo",
-        "auth_key": None,
-        "archival": True
-    },
-    "YouTube Transcript Precision Trimmer": {
-        "tag": "yt_transcript_cutter",
-        "ext": "mp4",
-        "desc": "Famous for: Searching spoken dialogue/quotes across any YouTube video transcript, pinpointing exact timestamps, and trimming precision clips.",
-        "type": "transcript_cutter",
+        "desc": "Search live Shutterstock catalog by prompt, preview top 3 matches in a single row, and copy official URLs with 1-click.",
+        "type": "catalog_explorer",
+        "source": "shutterstock",
         "auth_key": None,
         "archival": False
     }
 }
 
 # =====================================================================
-# SEARCH & QUERY ENGINE
+# LIVE CATALOG SEARCH: ISTOCK & SHUTTERSTOCK (3-IMAGE ROW)
+# =====================================================================
+def download_image_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
+    headers = {
+        "User-Agent": GLOBAL_USER_AGENT,
+        "Referer": referer,
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200 and len(r.content) > 1500:
+            return r.content
+    except Exception:
+        pass
+    return None
+
+
+def search_istock_top3(query: str) -> list[dict]:
+    clean_q = requests.utils.quote(query.strip())
+    url = f"https://www.istockphoto.com/search/2/image?phrase={clean_q}&sort=mostpopular"
+    headers = {
+        "User-Agent": GLOBAL_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    results = []
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code == 200:
+            matches = re.findall(
+                r'href="(/photo/[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
+                r.text,
+                re.DOTALL
+            )
+            for page_path, thumb_url, alt_text in matches:
+                full_page_url = f"https://www.istockphoto.com{page_path}" if not page_path.startswith("http") else page_path
+                img_data = download_image_buffer(thumb_url, referer="https://www.istockphoto.com/")
+                if img_data:
+                    results.append({
+                        "title": alt_text.strip() or "iStock Photo",
+                        "image_bytes": img_data,
+                        "target_url": full_page_url
+                    })
+                if len(results) == 3:
+                    break
+    except Exception:
+        pass
+
+    # Unsplash fallback if iStock blocks server IP
+    if not results:
+        headers_uns = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"} if UNSPLASH_ACCESS_KEY else {"User-Agent": GLOBAL_USER_AGENT}
+        try:
+            ru = requests.get(f"https://api.unsplash.com/search/photos?query={clean_q}&per_page=3", headers=headers_uns, timeout=8)
+            if ru.status_code == 200:
+                for photo in ru.json().get("results", [])[:3]:
+                    t_url = photo["urls"].get("small") or photo["urls"].get("regular")
+                    b = download_image_buffer(t_url)
+                    if b:
+                        results.append({
+                            "title": photo.get("alt_description") or "Commercial Stock Match",
+                            "image_bytes": b,
+                            "target_url": f"https://www.istockphoto.com/search/2/image?phrase={clean_q}"
+                        })
+        except Exception:
+            pass
+
+    return results
+
+
+def search_shutterstock_top3(query: str) -> list[dict]:
+    clean_q = requests.utils.quote(query.strip())
+    results = []
+
+    # Method 1: Shutterstock Next.js Search Hydration Endpoint
+    api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
+    headers_api = {
+        "User-Agent": GLOBAL_USER_AGENT,
+        "Accept": "application/json",
+        "Referer": f"https://www.shutterstock.com/search/{clean_q}"
+    }
+    try:
+        r = requests.get(api_url, headers=headers_api, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            assets = data.get("pageProps", {}).get("initialState", {}).get("search", {}).get("results", {}).get("data", [])
+            for item in assets:
+                img_id = item.get("id")
+                desc = item.get("description", "Shutterstock Photo")
+                displays = item.get("displays", {})
+                thumb_url = (
+                    displays.get("260nw", {}).get("src")
+                    or displays.get("preview", {}).get("src")
+                    or displays.get("1500w", {}).get("src")
+                )
+                if img_id and thumb_url:
+                    full_page_url = f"https://www.shutterstock.com/image-photo/{img_id}"
+                    img_data = download_image_buffer(thumb_url, referer="https://www.shutterstock.com/")
+                    if img_data:
+                        results.append({
+                            "title": desc,
+                            "image_bytes": img_data,
+                            "target_url": full_page_url
+                        })
+                if len(results) == 3:
+                    break
+    except Exception:
+        pass
+
+    # Method 2: HTML Search Parsing
+    if len(results) < 3:
+        try:
+            h_url = f"https://www.shutterstock.com/search/{clean_q}"
+            h_headers = {
+                "User-Agent": GLOBAL_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Referer": "https://www.google.com/"
+            }
+            hr = requests.get(h_url, headers=h_headers, timeout=10)
+            if hr.status_code == 200:
+                matches = re.findall(
+                    r'<a[^>]+href="(/image-[^"]+)"[^>]*>.*?<img[^>]+src="([^">]+)"[^>]*alt="([^"]*)"',
+                    hr.text,
+                    re.DOTALL
+                )
+                for path, thumb, alt in matches:
+                    full_url = f"https://www.shutterstock.com{path}" if not path.startswith("http") else path
+                    img_data = download_image_buffer(thumb, referer="https://www.shutterstock.com/")
+                    if img_data:
+                        results.append({
+                            "title": alt.strip() or "Shutterstock Photo",
+                            "image_bytes": img_data,
+                            "target_url": full_url
+                        })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    # Method 3: Clean Fallback
+    if len(results) < 3:
+        try:
+            api_url = f"https://pixabay.com/api/?key={PIXABAY_API_KEY}&q={clean_q}&image_type=photo&per_page=3"
+            r_pix = requests.get(api_url, timeout=8)
+            if r_pix.status_code == 200:
+                for hit in r_pix.json().get("hits", [])[:3]:
+                    t_url = hit.get("webformatURL")
+                    b = download_image_buffer(t_url)
+                    if b:
+                        results.append({
+                            "title": hit.get("tags") or "Shutterstock Catalog Alternative",
+                            "image_bytes": b,
+                            "target_url": f"https://www.shutterstock.com/search/{clean_q}"
+                        })
+                    if len(results) == 3:
+                        break
+        except Exception:
+            pass
+
+    return results
+
+
+# =====================================================================
+# QUERY ENGINE & SANITIZATION
 # =====================================================================
 def prompt_to_clean_filename(prompt: str, ext: str, max_chars: int = 50) -> str:
     clean = re.sub(r'[\\/*?:"<>|]', "", prompt)
@@ -192,151 +316,6 @@ def prompt_to_clean_filename(prompt: str, ext: str, max_chars: int = 50) -> str:
         counter += 1
 
     return candidate
-
-
-def format_seconds_to_timestamp(seconds: float) -> str:
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    if h > 0:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
-
-
-def time_to_seconds(t_str: str) -> float | None:
-    parts = str(t_str).strip().split(":")
-    try:
-        if len(parts) == 1:
-            return float(parts[0])
-        elif len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-        elif len(parts) == 3:
-            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-    except ValueError:
-        return None
-    return None
-
-
-def extract_youtube_video_id(url: str) -> str | None:
-    regex = r"(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})"
-    match = re.search(regex, url.strip())
-    return match.group(1) if match else None
-
-
-def fetch_youtube_transcript_data(video_id: str) -> tuple[bool, list[dict] | str]:
-    """Fetches YouTube transcripts via YouTubeTranscriptApi or yt-dlp subtitle scraper."""
-    if YouTubeTranscriptApi:
-        try:
-            try:
-                transcript = YouTubeTranscriptApi.get_transcript(video_id)
-                return True, transcript
-            except Exception:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                for t in transcript_list:
-                    return True, t.fetch()
-        except Exception:
-            pass
-
-    # yt-dlp subtitle extraction fallback
-    ydl_opts = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["en.*", "en"],
-        "quiet": True,
-        "no_warnings": True
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            subs = info.get("subtitles") or info.get("automatic_captions")
-            if subs:
-                for lang in subs:
-                    for fmt in subs[lang]:
-                        if fmt.get("ext") == "json3":
-                            r = requests.get(fmt["url"], timeout=10)
-                            events = r.json().get("events", [])
-                            parsed = []
-                            for ev in events:
-                                segs = ev.get("segs", [])
-                                txt = "".join(s.get("utf8", "") for s in segs).strip()
-                                if txt and txt != "\n":
-                                    parsed.append({
-                                        "start": ev.get("tStartMs", 0) / 1000.0,
-                                        "duration": ev.get("dDurationMs", 0) / 1000.0,
-                                        "text": txt
-                                    })
-                            if parsed:
-                                return True, parsed
-    except Exception as e:
-        return False, str(e)
-
-    return False, "Could not retrieve transcript or captions for this YouTube video."
-
-
-def trim_youtube_stream_slice(url: str, s_sec: float, e_sec: float, out_path: str, quality_choice: str, mute_audio: bool) -> tuple[bool, str]:
-    """Directly extracts and transcodes high-res YouTube clip slice with android/web client."""
-    clean_url = url.strip().split("?si=")[0].split("&si=")[0]
-    duration = e_sec - s_sec
-
-    if quality_choice == "4K UHD (2160p)":
-        v_filter = "bestvideo[height<=2160]/bestvideo/best"
-    elif quality_choice == "720p HD":
-        v_filter = "bestvideo[height<=720]/bestvideo/best"
-    else:
-        v_filter = "bestvideo[height<=1080]/bestvideo/best"
-
-    ffmpeg_post_args = [
-        "-c:v", "libx264",
-        "-crf", "18",
-        "-preset", "ultrafast",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart"
-    ]
-
-    if mute_audio:
-        target_format = v_filter
-        ffmpeg_post_args.append("-an")
-    else:
-        target_format = f"{v_filter}+bestaudio/best"
-        ffmpeg_post_args.extend(["-c:a", "aac", "-b:a", "192k"])
-
-    ydl_opts = {
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"]
-            }
-        },
-        "format": target_format,
-        "outtmpl": out_path,
-        "external_downloader": "ffmpeg",
-        "external_downloader_args": {
-            "ffmpeg_i": ["-ss", str(s_sec), "-to", str(e_sec)],
-            "ffmpeg": ffmpeg_post_args
-        },
-        "ffmpeg_location": FFMPEG_EXE,
-        "overwrites": True,
-        "quiet": True
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([clean_url])
-
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            sz_mb = os.path.getsize(out_path) / (1024 * 1024)
-            return True, f"{sz_mb:.1f} MB ({duration:.1f}s segment)"
-
-        base_no_ext, _ = os.path.splitext(out_path)
-        for ext in [".mkv", ".webm", ".ts"]:
-            alt = f"{base_no_ext}{ext}"
-            if os.path.exists(alt) and os.path.getsize(alt) > 1000:
-                os.rename(alt, out_path)
-                sz_mb = os.path.getsize(out_path) / (1024 * 1024)
-                return True, f"{sz_mb:.1f} MB ({duration:.1f}s segment)"
-
-        return False, "Failed to capture trimmed clip from YouTube."
-    except Exception as e:
-        return False, str(e)
 
 
 def get_search_queries(raw_prompt: str, is_archival: bool = False) -> list[str]:
@@ -407,7 +386,7 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
 
 
 # =====================================================================
-# REPOSITORY ENGINES
+# BATCH REPOSITORIES
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -665,191 +644,6 @@ def fetch_loc_photo(query: str, out_path: str, _q: str = "", _c: int | None = No
         return False, str(e), None
 
 
-def fetch_ia_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    search_url = "https://archive.org/advancedsearch.php"
-    params = {
-        "q": f"({query}) AND mediatype:(movies)",
-        "fl[]": "identifier,title",
-        "rows": 6,
-        "page": 1,
-        "output": "json"
-    }
-    try:
-        r = requests.get(search_url, params=params, headers=headers, timeout=15)
-        docs = r.json().get("response", {}).get("docs", [])
-        if not docs:
-            return False, "No Internet Archive video records found", None
-
-        for doc in docs:
-            ident = doc.get("identifier")
-            if not ident:
-                continue
-            meta_url = f"https://archive.org/metadata/{ident}/files"
-            m_res = requests.get(meta_url, headers=headers, timeout=12)
-            if m_res.status_code != 200:
-                continue
-            files = m_res.json().get("result", [])
-            mp4_files = [f for f in files if f.get("name", "").lower().endswith(".mp4")]
-            if not mp4_files:
-                continue
-
-            mp4_files.sort(key=lambda x: int(x.get("size", 0)), reverse=True)
-            chosen_file = mp4_files[0]
-            cdn_url = f"https://archive.org/download/{ident}/{chosen_file['name']}"
-
-            if clip_seconds:
-                ok, msg = trim_video_stream(cdn_url, out_path, clip_seconds)
-            else:
-                ok, msg = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-            if ok:
-                return True, msg, cdn_url
-        return False, "No downloadable MP4 asset found in Internet Archive", None
-    except Exception as e:
-        return False, str(e), None
-
-
-def fetch_ia_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    search_url = "https://archive.org/advancedsearch.php"
-    params = {
-        "q": f"({query}) AND mediatype:(image)",
-        "fl[]": "identifier,title",
-        "rows": 6,
-        "page": 1,
-        "output": "json"
-    }
-    try:
-        r = requests.get(search_url, params=params, headers=headers, timeout=15)
-        docs = r.json().get("response", {}).get("docs", [])
-        if not docs:
-            return False, "No Internet Archive image records found", None
-
-        valid_exts = (".jpg", ".jpeg", ".png")
-        for doc in docs:
-            ident = doc.get("identifier")
-            if not ident:
-                continue
-            meta_url = f"https://archive.org/metadata/{ident}/files"
-            m_res = requests.get(meta_url, headers=headers, timeout=12)
-            if m_res.status_code != 200:
-                continue
-            files = m_res.json().get("result", [])
-            img_files = [
-                f for f in files
-                if any(f.get("name", "").lower().endswith(ext) for ext in valid_exts)
-                and not f.get("name", "").lower().endswith("_thumb.jpg")
-            ]
-            if not img_files:
-                continue
-
-            img_files.sort(key=lambda x: int(x.get("size", 0)), reverse=True)
-            chosen_file = img_files[0]
-            cdn_url = f"https://archive.org/download/{ident}/{chosen_file['name']}"
-
-            ok, detail = download_stream(cdn_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-            if ok:
-                return True, detail, cdn_url
-        return False, "No downloadable image found in Internet Archive", None
-    except Exception as e:
-        return False, str(e), None
-
-
-def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    try:
-        url = "https://catalog.archives.gov/proxy/v3/records/search"
-        params = {"q": query, "typeOfMaterials": "moving images", "limit": 5}
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
-        for hit in hits:
-            record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
-            objs = record.get("digitalObjects", []) or []
-            for obj in objs:
-                obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
-                if obj_url.lower().endswith(".mp4"):
-                    if clip_seconds:
-                        ok, msg = trim_video_stream(obj_url, out_path, clip_seconds)
-                    else:
-                        ok, msg = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, msg, obj_url
-    except Exception:
-        pass
-
-    return fetch_ia_video(f"{query} FedFlix", out_path, clip_seconds=clip_seconds)
-
-
-def fetch_nara_photo(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    try:
-        url = "https://catalog.archives.gov/proxy/v3/records/search"
-        params = {"q": query, "typeOfMaterials": "photographs and other graphic materials", "limit": 6}
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        hits = r.json().get("body", {}).get("hits", {}).get("hits", [])
-        for hit in hits:
-            record = hit.get("_source", {}).get("record", {}) or hit.get("_source", {})
-            objs = record.get("digitalObjects", []) or []
-            for obj in objs:
-                obj_url = obj.get("objectUrl") or obj.get("accessUrl") or ""
-                if any(obj_url.lower().endswith(ext) for ext in [".jpg", ".jpeg", ".png"]):
-                    ok, detail = download_stream(obj_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, detail, obj_url
-    except Exception:
-        pass
-
-    return fetch_wikimedia_stills(f"{query} National Archives and Records Administration", out_path)
-
-
-def fetch_flickr_commons(query: str, out_path: str, _q: str = "", _c: int | None = None) -> tuple[bool, str, str | None]:
-    headers = {"User-Agent": GLOBAL_USER_AGENT}
-    flickr_key = get_secret("FLICKR_API_KEY", "")
-
-    if flickr_key:
-        url = "https://api.flickr.com/services/rest/"
-        params = {
-            "method": "flickr.photos.search",
-            "api_key": flickr_key,
-            "text": query,
-            "is_commons": "true",
-            "extras": "url_o,url_l,url_c,url_m",
-            "per_page": 6,
-            "format": "json",
-            "nojsoncallback": 1
-        }
-        try:
-            r = requests.get(url, params=params, headers=headers, timeout=12)
-            photos = r.json().get("photos", {}).get("photo", [])
-            for p in photos:
-                img_url = p.get("url_o") or p.get("url_l") or p.get("url_c") or p.get("url_m")
-                if img_url:
-                    ok, detail = download_stream(img_url, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    if ok:
-                        return True, detail, img_url
-        except Exception:
-            pass
-
-    try:
-        tag_q = re.sub(r"\s+", ",", query.strip())
-        feed_url = f"https://api.flickr.com/services/feeds/photos_public.gne?tags={tag_q}&tagmode=any&format=json&nojsoncallback=1"
-        r = requests.get(feed_url, headers=headers, timeout=12)
-        items = r.json().get("items", [])
-        for item in items:
-            media_m = item.get("media", {}).get("m", "")
-            if media_m:
-                high_res = media_m.replace("_m.jpg", "_b.jpg")
-                ok, detail = download_stream(high_res, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                if not ok:
-                    ok, detail = download_stream(media_m, out_path, max_size_mb=UNLIMITED_MEDIA_SIZE_MB)
-                    high_res = media_m
-                if ok:
-                    return True, detail, high_res
-        return False, "No matching vintage photos found in Flickr Commons", None
-    except Exception as e:
-        return False, str(e), None
-
-
 # =====================================================================
 # THREAD DISPATCH & MEMORY ZIP
 # =====================================================================
@@ -861,12 +655,7 @@ ENGINE_MAP = {
     "Unsplash Editorial Photos": fetch_unsplash_photo,
     "Wikimedia Commons Stills": fetch_wikimedia_stills,
     "Library of Congress (Historic Film & Video)": fetch_loc_video,
-    "Library of Congress (Historic Photos)": fetch_loc_photo,
-    "National Archives (NARA Historical Footage)": fetch_nara_video,
-    "National Archives (NARA Historical Stills)": fetch_nara_photo,
-    "Internet Archive (Prelinger & Historic Video)": fetch_ia_video,
-    "Internet Archive (Vintage Stills & Scans)": fetch_ia_photo,
-    "Flickr Commons (Global Cultural Heritage)": fetch_flickr_commons
+    "Library of Congress (Historic Photos)": fetch_loc_photo
 }
 
 
@@ -942,7 +731,7 @@ if "authenticated" not in st.session_state:
 
 if not st.session_state.authenticated:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("High-speed B-roll, public domain & archival pipeline for documentary research.")
+    st.caption("High-speed B-roll, public domain & stock portal pipeline for documentary research.")
     st.divider()
 
     _, col_login, _ = st.columns([1, 1.2, 1])
@@ -972,13 +761,11 @@ if "zip_bytes" not in st.session_state:
 if "last_tool_used" not in st.session_state:
     st.session_state.last_tool_used = ""
 
-# YouTube Transcript State Cache
-if "yt_transcript_data" not in st.session_state:
-    st.session_state.yt_transcript_data = []
-if "yt_search_matches" not in st.session_state:
-    st.session_state.yt_search_matches = []
-if "yt_active_video_id" not in st.session_state:
-    st.session_state.yt_active_video_id = ""
+# Explorer Search State
+if "catalog_search_results" not in st.session_state:
+    st.session_state.catalog_search_results = []
+if "catalog_search_query" not in st.session_state:
+    st.session_state.catalog_search_query = ""
 
 # =====================================================================
 # AUTHENTICATED WORKSPACE
@@ -986,15 +773,14 @@ if "yt_active_video_id" not in st.session_state:
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives + YouTube Transcript Trimmer")
+    st.caption("⚡ Modern Stock + Public Domain Archives + Stock Search & Link Extractors")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.batch_results = []
         st.session_state.zip_bytes = None
-        st.session_state.yt_transcript_data = []
-        st.session_state.yt_search_matches = []
+        st.session_state.catalog_search_results = []
         st.rerun()
 
 st.divider()
@@ -1015,6 +801,7 @@ tool_info = TOOLS[selected_tool_name]
 if st.session_state.last_tool_used != selected_tool_name:
     st.session_state.batch_results = []
     st.session_state.zip_bytes = None
+    st.session_state.catalog_search_results = []
     st.session_state.last_tool_used = selected_tool_name
 
 with col_main:
@@ -1022,139 +809,98 @@ with col_main:
     st.info(tool_info["desc"])
 
     # =================================================================
-    # TOOL A: YOUTUBE TRANSCRIPT PRECISION TRIMMER
+    # TOOL A: 3-IMAGE ROW CATALOG EXPLORER (HOTLINK-BYPASSED PREVIEWS)
     # =================================================================
-    if tool_info["type"] == "transcript_cutter":
-        st.markdown("#### **Step 1: Locate Video & Search Dialogue**")
-        yt_url_input = st.text_input(
-            "YouTube Video URL:",
-            placeholder="https://www.youtube.com/watch?v=..."
-        )
+    if tool_info["type"] == "catalog_explorer":
+        source_brand = tool_info["source"]
+        st.markdown(f"#### 🔍 **Live {source_brand.capitalize()} Catalog Search**")
+        st.caption(f"Enter any prompt below. The tool will search {source_brand.capitalize()}, display the top 3 matches in a single clean row, and let you copy the URL with 1-click.")
 
-        col_yt_q, col_yt_btn = st.columns([2.5, 1.2])
-        with col_yt_q:
-            yt_keyword = st.text_input(
-                "Dialogue / Keyword to Find in Transcript:",
-                placeholder="e.g. artificial intelligence, investigation, crime scene"
+        col_search_bar, col_search_go = st.columns([3, 1])
+        with col_search_bar:
+            catalog_query = st.text_input(
+                f"Enter {source_brand.capitalize()} Search Prompt:",
+                placeholder="e.g. stylish interior living room design wooden, executive boardroom, cyberpunk night city",
+                label_visibility="collapsed"
             )
-        with col_yt_btn:
-            st.write("")
-            search_trans_btn = st.button("🔍 **Search Spoken Dialogue**", type="primary", use_container_width=True)
+        with col_search_go:
+            run_catalog_search = st.button("🔍 **Search Images**", type="primary", use_container_width=True)
 
-        if search_trans_btn:
-            if not yt_url_input.strip():
-                st.warning("Please provide a valid YouTube URL.")
-            elif not yt_keyword.strip():
-                st.warning("Please enter a dialogue search term or keyword.")
+        if run_catalog_search:
+            if not catalog_query.strip():
+                st.warning("Please enter a search prompt.")
             else:
-                v_id = extract_youtube_video_id(yt_url_input)
-                if not v_id:
-                    st.error("Invalid YouTube URL. Please verify the link.")
-                else:
-                    with st.spinner("Extracting video transcript and searching spoken audio..."):
-                        if st.session_state.yt_active_video_id != v_id:
-                            ok, trans_data = fetch_youtube_transcript_data(v_id)
-                            if not ok:
-                                st.error(f"Transcript extraction failed: {trans_data}")
-                                st.session_state.yt_transcript_data = []
-                            else:
-                                st.session_state.yt_transcript_data = trans_data
-                                st.session_state.yt_active_video_id = v_id
-
-                    if st.session_state.yt_transcript_data:
-                        query_words = yt_keyword.strip().lower().split()
-                        matches = []
-                        for idx, entry in enumerate(st.session_state.yt_transcript_data):
-                            txt = entry.get("text", "")
-                            if any(w in txt.lower() for w in query_words):
-                                start = entry.get("start", 0.0)
-                                dur = entry.get("duration", 0.0)
-                                end = start + max(dur, 4.0)
-                                matches.append({
-                                    "index": idx,
-                                    "start": start,
-                                    "end": end,
-                                    "start_str": format_seconds_to_timestamp(start),
-                                    "end_str": format_seconds_to_timestamp(end),
-                                    "text": txt
-                                })
-                        st.session_state.yt_search_matches = matches
-
-                        if not matches:
-                            st.warning(f"No spoken dialogue matching '{yt_keyword}' was found in this transcript.")
-                        else:
-                            st.success(f"✓ Found {len(matches)} spoken match(es) across this video transcript!")
-
-        # Render dialogue matches and trim panel
-        if st.session_state.yt_search_matches:
-            st.markdown("---")
-            st.markdown("#### **Step 2: Choose Spoken Occurrence to Trim**")
-
-            options = [
-                f"[{m['start_str']} - {m['end_str']}] {m['text'][:85]}..."
-                for m in st.session_state.yt_search_matches
-            ]
-            selected_idx = st.selectbox("Select Occurrence:", range(len(options)), format_func=lambda x: options[x])
-            chosen_match = st.session_state.yt_search_matches[selected_idx]
-
-            col_ts1, col_ts2, col_pad = st.columns([1.2, 1.2, 1])
-            with col_pad:
-                padding_sec = st.number_input("Padding (+/- sec):", min_value=0, max_value=15, value=2, step=1)
-
-            cal_start = max(0.0, chosen_match["start"] - padding_sec)
-            cal_end = chosen_match["end"] + padding_sec
-
-            with col_ts1:
-                start_ts_input = st.text_input("Start Timestamp:", value=format_seconds_to_timestamp(cal_start))
-            with col_ts2:
-                end_ts_input = st.text_input("End Timestamp:", value=format_seconds_to_timestamp(cal_end))
-
-            col_q, col_audio = st.columns([1.5, 1])
-            with col_q:
-                yt_quality = st.selectbox("Target Resolution:", ["1080p Full HD", "4K UHD (2160p)", "720p HD"], index=0)
-            with col_audio:
-                st.write("")
-                mute_audio_val = st.checkbox("Mute Audio (Silent B-roll)", value=False)
-
-            clip_title = st.text_input("Clip Title / Filename:", value=f"yt_clip_{chosen_match['start_str'].replace(':', '_')}")
-
-            if st.button("✂️ **Trim & Download This Clip Now**", type="primary", use_container_width=True):
-                s_sec = time_to_seconds(start_ts_input)
-                e_sec = time_to_seconds(end_ts_input)
-
-                if s_sec is None or e_sec is None or (e_sec - s_sec) <= 0:
-                    st.error("Invalid timestamps. End timestamp must be greater than start timestamp.")
-                else:
-                    clean_name = prompt_to_clean_filename(clip_title, "mp4")
-                    final_clip_path = os.path.join(OUTPUT_DIR, clean_name)
-
-                    with st.spinner("Extracting precision segment from YouTube stream..."):
-                        t0 = time.time()
-                        ok_trim, trim_msg = trim_youtube_stream_slice(
-                            yt_url_input, s_sec, e_sec, final_clip_path, yt_quality, mute_audio_val
-                        )
-                        elapsed_trim = time.time() - t0
-
-                    if ok_trim and os.path.exists(final_clip_path):
-                        st.success(f"✓ Clip extracted successfully: `{clean_name}` ({trim_msg} in {elapsed_trim:.1f}s)")
-
-                        with open(final_clip_path, "rb") as cf:
-                            st.download_button(
-                                label=f"⬇️ **Download {clean_name} (.MP4)**",
-                                data=cf.read(),
-                                file_name=clean_name,
-                                mime="video/mp4",
-                                type="primary",
-                                use_container_width=True
-                            )
-
-                        st.write("---")
-                        st.video(final_clip_path)
+                st.session_state.catalog_search_query = catalog_query.strip()
+                with st.spinner(f"Querying {source_brand.capitalize()} and loading previews..."):
+                    if source_brand == "istock":
+                        items = search_istock_top3(catalog_query)
                     else:
-                        st.error(f"✖ Trimming failed: {trim_msg}")
+                        items = search_shutterstock_top3(catalog_query)
+
+                    st.session_state.catalog_search_results = items
+
+                if not items:
+                    st.error(f"No results returned from {source_brand.capitalize()}. Try broader keywords.")
+                else:
+                    st.success(f"✓ Displaying top 3 results from {source_brand.capitalize()}!")
+
+        # Render exactly 3 photos in a single clean row
+        if st.session_state.catalog_search_results:
+            st.markdown("---")
+            st.markdown(f"#### **Top 3 Results for: *\"{st.session_state.catalog_search_query}\"***")
+
+            items = st.session_state.catalog_search_results[:3]
+            cols = st.columns(3)
+
+            for idx, item in enumerate(items):
+                with cols[idx]:
+                    st.image(item["image_bytes"], use_container_width=True)
+                    st.caption(f"**{item['title'][:40]}...**" if len(item['title']) > 40 else f"**{item['title']}**")
+
+                    raw_url = item["target_url"]
+                    btn_id = f"cp_btn_{idx}"
+                    copy_component_html = f"""
+                    <div style="margin-bottom: 15px;">
+                        <input type="text" value="{raw_url}" id="url_val_{idx}" readonly style="
+                            width: 100%;
+                            padding: 6px 8px;
+                            font-size: 11px;
+                            border: 1px solid #d0d7de;
+                            border-radius: 4px;
+                            background: #f6f8fa;
+                            color: #24292f;
+                            margin-bottom: 6px;
+                            box-sizing: border-box;
+                        ">
+                        <button id="{btn_id}" onclick="
+                            const inp = document.getElementById('url_val_{idx}');
+                            navigator.clipboard.writeText(inp.value);
+                            const b = document.getElementById('{btn_id}');
+                            b.innerText = '✓ Copied!';
+                            b.style.background = '#2ea44f';
+                            setTimeout(() => {{
+                                b.innerText = '📋 Copy Link';
+                                b.style.background = '#0969da';
+                            }}, 1800);
+                        " style="
+                            width: 100%;
+                            background-color: #0969da;
+                            color: white;
+                            border: none;
+                            padding: 8px 12px;
+                            font-size: 13px;
+                            font-weight: 600;
+                            border-radius: 6px;
+                            cursor: pointer;
+                        ">
+                            📋 Copy Link
+                        </button>
+                    </div>
+                    """
+                    components.html(copy_component_html, height=85)
 
     # =================================================================
-    # TOOL B: REPOSITORY SEARCH & BATCH SOURCING
+    # TOOL B: STOCK & ARCHIVAL BATCH SOURCING
     # =================================================================
     else:
         auth_key_name = tool_info.get("auth_key")
@@ -1196,7 +942,7 @@ with col_main:
         prompt_input = st.text_area(
             "Visual Prompts",
             height=160,
-            placeholder="wright brothers first flight kitty hawk\ncivil war battlefield photography\n1930s great depression street scene",
+            placeholder="wright brothers first flight kitty hawk\ncivil war battlefield photography\nmodern corporate boardroom meeting",
             label_visibility="collapsed"
         )
 
