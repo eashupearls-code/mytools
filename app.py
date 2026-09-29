@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+import yt_dlp
 
 # Locate FFmpeg
 try:
@@ -15,6 +16,12 @@ try:
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_EXE = "ffmpeg"
+
+# Optional fast transcript library
+try:
+    from youtube_transcript_api import YouTubeTranscriptApi
+except ImportError:
+    YouTubeTranscriptApi = None
 
 # =====================================================================
 # CONFIGURATION & SECRETS
@@ -31,7 +38,7 @@ def get_secret(key: str, default: str = "") -> str:
 PEXELS_API_KEY = get_secret("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = get_secret("PIXABAY_API_KEY", "")
 UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
-FLICKR_API_KEY = get_secret("FLICKR_API_KEY", "")  # Optional: falls back to public Commons feed if empty
+FLICKR_API_KEY = get_secret("FLICKR_API_KEY", "")
 
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -155,11 +162,19 @@ TOOLS = {
         "type": "photo",
         "auth_key": None,
         "archival": True
+    },
+    "YouTube Transcript Precision Trimmer": {
+        "tag": "yt_transcript_cutter",
+        "ext": "mp4",
+        "desc": "Famous for: Searching spoken dialogue/quotes across any YouTube video transcript, pinpointing exact timestamps, and trimming precision clips.",
+        "type": "transcript_cutter",
+        "auth_key": None,
+        "archival": False
     }
 }
 
 # =====================================================================
-# INTELLIGENT MULTI-TIER SEARCH QUERY MECHANISM
+# SEARCH & QUERY ENGINE
 # =====================================================================
 def prompt_to_clean_filename(prompt: str, ext: str, max_chars: int = 50) -> str:
     clean = re.sub(r'[\\/*?:"<>|]', "", prompt)
@@ -179,30 +194,166 @@ def prompt_to_clean_filename(prompt: str, ext: str, max_chars: int = 50) -> str:
     return candidate
 
 
+def format_seconds_to_timestamp(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def time_to_seconds(t_str: str) -> float | None:
+    parts = str(t_str).strip().split(":")
+    try:
+        if len(parts) == 1:
+            return float(parts[0])
+        elif len(parts) == 2:
+            return float(parts[0]) * 60 + float(parts[1])
+        elif len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    except ValueError:
+        return None
+    return None
+
+
+def extract_youtube_video_id(url: str) -> str | None:
+    regex = r"(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})"
+    match = re.search(regex, url.strip())
+    return match.group(1) if match else None
+
+
+def fetch_youtube_transcript_data(video_id: str) -> tuple[bool, list[dict] | str]:
+    """Fetches YouTube transcripts via YouTubeTranscriptApi or yt-dlp subtitle scraper."""
+    if YouTubeTranscriptApi:
+        try:
+            try:
+                transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                return True, transcript
+            except Exception:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                for t in transcript_list:
+                    return True, t.fetch()
+        except Exception:
+            pass
+
+    # yt-dlp subtitle extraction fallback
+    ydl_opts = {
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["en.*", "en"],
+        "quiet": True,
+        "no_warnings": True
+    }
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+            subs = info.get("subtitles") or info.get("automatic_captions")
+            if subs:
+                for lang in subs:
+                    for fmt in subs[lang]:
+                        if fmt.get("ext") == "json3":
+                            r = requests.get(fmt["url"], timeout=10)
+                            events = r.json().get("events", [])
+                            parsed = []
+                            for ev in events:
+                                segs = ev.get("segs", [])
+                                txt = "".join(s.get("utf8", "") for s in segs).strip()
+                                if txt and txt != "\n":
+                                    parsed.append({
+                                        "start": ev.get("tStartMs", 0) / 1000.0,
+                                        "duration": ev.get("dDurationMs", 0) / 1000.0,
+                                        "text": txt
+                                    })
+                            if parsed:
+                                return True, parsed
+    except Exception as e:
+        return False, str(e)
+
+    return False, "Could not retrieve transcript or captions for this YouTube video."
+
+
+def trim_youtube_stream_slice(url: str, s_sec: float, e_sec: float, out_path: str, quality_choice: str, mute_audio: bool) -> tuple[bool, str]:
+    """Directly extracts and transcodes high-res YouTube clip slice with android/web client."""
+    clean_url = url.strip().split("?si=")[0].split("&si=")[0]
+    duration = e_sec - s_sec
+
+    if quality_choice == "4K UHD (2160p)":
+        v_filter = "bestvideo[height<=2160]/bestvideo/best"
+    elif quality_choice == "720p HD":
+        v_filter = "bestvideo[height<=720]/bestvideo/best"
+    else:
+        v_filter = "bestvideo[height<=1080]/bestvideo/best"
+
+    ffmpeg_post_args = [
+        "-c:v", "libx264",
+        "-crf", "18",
+        "-preset", "ultrafast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart"
+    ]
+
+    if mute_audio:
+        target_format = v_filter
+        ffmpeg_post_args.append("-an")
+    else:
+        target_format = f"{v_filter}+bestaudio/best"
+        ffmpeg_post_args.extend(["-c:a", "aac", "-b:a", "192k"])
+
+    ydl_opts = {
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
+        "format": target_format,
+        "outtmpl": out_path,
+        "external_downloader": "ffmpeg",
+        "external_downloader_args": {
+            "ffmpeg_i": ["-ss", str(s_sec), "-to", str(e_sec)],
+            "ffmpeg": ffmpeg_post_args
+        },
+        "ffmpeg_location": FFMPEG_EXE,
+        "overwrites": True,
+        "quiet": True
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([clean_url])
+
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            sz_mb = os.path.getsize(out_path) / (1024 * 1024)
+            return True, f"{sz_mb:.1f} MB ({duration:.1f}s segment)"
+
+        base_no_ext, _ = os.path.splitext(out_path)
+        for ext in [".mkv", ".webm", ".ts"]:
+            alt = f"{base_no_ext}{ext}"
+            if os.path.exists(alt) and os.path.getsize(alt) > 1000:
+                os.rename(alt, out_path)
+                sz_mb = os.path.getsize(out_path) / (1024 * 1024)
+                return True, f"{sz_mb:.1f} MB ({duration:.1f}s segment)"
+
+        return False, "Failed to capture trimmed clip from YouTube."
+    except Exception as e:
+        return False, str(e)
+
+
 def get_search_queries(raw_prompt: str, is_archival: bool = False) -> list[str]:
-    """
-    Multi-tier query builder:
-    - Tier 1: Verbatim query (clean)
-    - Tier 2: Filler/stop-word stripped query
-    - Tier 3: Archival modifier stripped query (strips 'cinematic', 'drone', '4k', etc. for catalogs)
-    """
     clean = re.sub(r"[^\w\s-]", " ", raw_prompt).strip()
     clean = re.sub(r"\s+", " ", clean)
     queries = [clean]
 
-    # Keyword query (without prepositions/fillers)
     words = [w for w in clean.split() if w.lower() not in GRAMMAR_FILLERS]
     keyword_q = " ".join(words)
     if keyword_q and keyword_q != clean:
         queries.append(keyword_q)
 
-    # Core historical subject query (strips cinematic fluff)
     archival_words = [w for w in words if w.lower() not in ARCHIVAL_MODIFIERS]
     archival_q = " ".join(archival_words)
     if archival_q and archival_q not in queries:
         queries.append(archival_q)
 
-    # Prioritize clean subject terms for historical databases to maximize catalog hits
     if is_archival and archival_q:
         queries.remove(archival_q)
         queries.insert(0, archival_q)
@@ -256,7 +407,7 @@ def trim_video_stream(cdn_url: str, output_path: str, duration_sec: int) -> tupl
 
 
 # =====================================================================
-# FETCH ENGINES: STOCK + PUBLIC DOMAIN ARCHIVES
+# REPOSITORY ENGINES
 # =====================================================================
 def fetch_pexels_video(query: str, out_path: str, quality_choice: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
     if not PEXELS_API_KEY:
@@ -605,7 +756,6 @@ def fetch_ia_photo(query: str, out_path: str, _q: str = "", _c: int | None = Non
 
 
 def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int | None = None) -> tuple[bool, str, str | None]:
-    # Query unauthenticated NARA Catalog Proxy API with Internet Archive FedFlix fallback
     headers = {"User-Agent": GLOBAL_USER_AGENT}
     try:
         url = "https://catalog.archives.gov/proxy/v3/records/search"
@@ -627,7 +777,6 @@ def fetch_nara_video(query: str, out_path: str, _q: str = "", clip_seconds: int 
     except Exception:
         pass
 
-    # Seamless fallback to NARA FedFlix military collection on Archive.org
     return fetch_ia_video(f"{query} FedFlix", out_path, clip_seconds=clip_seconds)
 
 
@@ -650,7 +799,6 @@ def fetch_nara_photo(query: str, out_path: str, _q: str = "", _c: int | None = N
     except Exception:
         pass
 
-    # Fallback to digitized NARA records hosted on Wikimedia Commons
     return fetch_wikimedia_stills(f"{query} National Archives and Records Administration", out_path)
 
 
@@ -682,7 +830,6 @@ def fetch_flickr_commons(query: str, out_path: str, _q: str = "", _c: int | None
         except Exception:
             pass
 
-    # Fallback: query public tag-based Commons feed without an API key
     try:
         tag_q = re.sub(r"\s+", ",", query.strip())
         feed_url = f"https://api.flickr.com/services/feeds/photos_public.gne?tags={tag_q}&tagmode=any&format=json&nojsoncallback=1"
@@ -704,7 +851,7 @@ def fetch_flickr_commons(query: str, out_path: str, _q: str = "", _c: int | None
 
 
 # =====================================================================
-# THREADED DISPATCH & MEMORY ZIP BUILDING
+# THREAD DISPATCH & MEMORY ZIP
 # =====================================================================
 ENGINE_MAP = {
     "Stock Video Footage (Pexels)": fetch_pexels_video,
@@ -736,7 +883,6 @@ def process_single_prompt(prompt: str, tool_name: str, ext: str, quality_choice:
     detail = "Search returned no records"
     cdn_url = None
 
-    # Step through multi-tier queries until an asset is found
     for q in query_candidates:
         ok, detail, cdn_url = fetch_func(q, out_path, quality_choice, clip_seconds)
         if ok:
@@ -826,19 +972,29 @@ if "zip_bytes" not in st.session_state:
 if "last_tool_used" not in st.session_state:
     st.session_state.last_tool_used = ""
 
+# YouTube Transcript State Cache
+if "yt_transcript_data" not in st.session_state:
+    st.session_state.yt_transcript_data = []
+if "yt_search_matches" not in st.session_state:
+    st.session_state.yt_search_matches = []
+if "yt_active_video_id" not in st.session_state:
+    st.session_state.yt_active_video_id = ""
+
 # =====================================================================
 # AUTHENTICATED WORKSPACE
 # =====================================================================
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Modern Stock + Public Domain Archives (LOC, NARA, Wikimedia, Flickr, Internet Archive)")
+    st.caption("⚡ Modern Stock + Public Domain Archives + YouTube Transcript Trimmer")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
         st.session_state.authenticated = False
         st.session_state.batch_results = []
         st.session_state.zip_bytes = None
+        st.session_state.yt_transcript_data = []
+        st.session_state.yt_search_matches = []
         st.rerun()
 
 st.divider()
@@ -865,192 +1021,326 @@ with col_main:
     st.markdown(f"### **Tool: {selected_tool_name}**")
     st.info(tool_info["desc"])
 
-    auth_key_name = tool_info.get("auth_key")
-    if auth_key_name:
-        current_key = globals().get(auth_key_name, "")
-        if not current_key:
-            st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+    # =================================================================
+    # TOOL A: YOUTUBE TRANSCRIPT PRECISION TRIMMER
+    # =================================================================
+    if tool_info["type"] == "transcript_cutter":
+        st.markdown("#### **Step 1: Locate Video & Search Dialogue**")
+        yt_url_input = st.text_input(
+            "YouTube Video URL:",
+            placeholder="https://www.youtube.com/watch?v=..."
+        )
 
-    quality_choice = "1080p Full HD"
-    clip_seconds = 10
-
-    if tool_info["type"] == "video":
-        col_q1, col_q2 = st.columns(2)
-        with col_q1:
-            st.markdown("**Clip Length**")
-            clip_label = st.selectbox(
-                "Clip Length",
-                ["10 Seconds (Default)", "15 Seconds", "Full Video Length"],
-                index=0,
-                label_visibility="collapsed"
+        col_yt_q, col_yt_btn = st.columns([2.5, 1.2])
+        with col_yt_q:
+            yt_keyword = st.text_input(
+                "Dialogue / Keyword to Find in Transcript:",
+                placeholder="e.g. artificial intelligence, investigation, crime scene"
             )
-            if clip_label == "10 Seconds (Default)":
-                clip_seconds = 10
-            elif clip_label == "15 Seconds":
-                clip_seconds = 15
+        with col_yt_btn:
+            st.write("")
+            search_trans_btn = st.button("🔍 **Search Spoken Dialogue**", type="primary", use_container_width=True)
+
+        if search_trans_btn:
+            if not yt_url_input.strip():
+                st.warning("Please provide a valid YouTube URL.")
+            elif not yt_keyword.strip():
+                st.warning("Please enter a dialogue search term or keyword.")
             else:
-                clip_seconds = None
+                v_id = extract_youtube_video_id(yt_url_input)
+                if not v_id:
+                    st.error("Invalid YouTube URL. Please verify the link.")
+                else:
+                    with st.spinner("Extracting video transcript and searching spoken audio..."):
+                        if st.session_state.yt_active_video_id != v_id:
+                            ok, trans_data = fetch_youtube_transcript_data(v_id)
+                            if not ok:
+                                st.error(f"Transcript extraction failed: {trans_data}")
+                                st.session_state.yt_transcript_data = []
+                            else:
+                                st.session_state.yt_transcript_data = trans_data
+                                st.session_state.yt_active_video_id = v_id
 
-        with col_q2:
-            st.markdown("**Quality**")
-            quality_choice = st.selectbox(
-                "Quality",
-                ["1080p Full HD", "4K UHD (2160p)", "720p HD"],
-                index=0,
-                label_visibility="collapsed"
-            )
+                    if st.session_state.yt_transcript_data:
+                        query_words = yt_keyword.strip().lower().split()
+                        matches = []
+                        for idx, entry in enumerate(st.session_state.yt_transcript_data):
+                            txt = entry.get("text", "")
+                            if any(w in txt.lower() for w in query_words):
+                                start = entry.get("start", 0.0)
+                                dur = entry.get("duration", 0.0)
+                                end = start + max(dur, 4.0)
+                                matches.append({
+                                    "index": idx,
+                                    "start": start,
+                                    "end": end,
+                                    "start_str": format_seconds_to_timestamp(start),
+                                    "end_str": format_seconds_to_timestamp(end),
+                                    "text": txt
+                                })
+                        st.session_state.yt_search_matches = matches
 
-    st.markdown("**Visual Prompts (one prompt per line)**")
-    prompt_input = st.text_area(
-        "Visual Prompts",
-        height=160,
-        placeholder="wright brothers first flight kitty hawk\ncivil war battlefield photography\n1930s great depression street scene",
-        label_visibility="collapsed"
-    )
+                        if not matches:
+                            st.warning(f"No spoken dialogue matching '{yt_keyword}' was found in this transcript.")
+                        else:
+                            st.success(f"✓ Found {len(matches)} spoken match(es) across this video transcript!")
 
-    col_btn1, col_btn2 = st.columns([1.3, 1])
-    with col_btn1:
-        start_btn = st.button("⚡ **Start Fast Parallel Sourcing**", type="primary", use_container_width=True)
-    with col_btn2:
-        if st.session_state.batch_results:
-            if st.button("**Clear Results**", use_container_width=True):
-                st.session_state.batch_results = []
-                st.session_state.zip_bytes = None
-                st.rerun()
+        # Render dialogue matches and trim panel
+        if st.session_state.yt_search_matches:
+            st.markdown("---")
+            st.markdown("#### **Step 2: Choose Spoken Occurrence to Trim**")
 
-    if start_btn:
-        lines = [line.strip() for line in prompt_input.splitlines() if line.strip()]
-        if not lines:
-            st.warning("Please enter at least one visual prompt.")
-        else:
-            ext = tool_info["ext"]
-            st.session_state.batch_results = []
-            st.session_state.zip_bytes = None
+            options = [
+                f"[{m['start_str']} - {m['end_str']}] {m['text'][:85]}..."
+                for m in st.session_state.yt_search_matches
+            ]
+            selected_idx = st.selectbox("Select Occurrence:", range(len(options)), format_func=lambda x: options[x])
+            chosen_match = st.session_state.yt_search_matches[selected_idx]
 
-            with st.spinner(f"Fetching {len(lines)} asset(s) simultaneously from edge servers..."):
-                t_all = time.time()
+            col_ts1, col_ts2, col_pad = st.columns([1.2, 1.2, 1])
+            with col_pad:
+                padding_sec = st.number_input("Padding (+/- sec):", min_value=0, max_value=15, value=2, step=1)
 
-                with ThreadPoolExecutor(max_workers=min(len(lines), 8)) as executor:
-                    futures = [
-                        executor.submit(process_single_prompt, line, selected_tool_name, ext, quality_choice, clip_seconds)
-                        for line in lines
-                    ]
-                    results = [f.result() for f in futures]
+            cal_start = max(0.0, chosen_match["start"] - padding_sec)
+            cal_end = chosen_match["end"] + padding_sec
 
-                st.session_state.batch_results = results
+            with col_ts1:
+                start_ts_input = st.text_input("Start Timestamp:", value=format_seconds_to_timestamp(cal_start))
+            with col_ts2:
+                end_ts_input = st.text_input("End Timestamp:", value=format_seconds_to_timestamp(cal_end))
 
-                valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
-                if valid_paths:
-                    st.session_state.zip_bytes = create_in_memory_zip(valid_paths)
+            col_q, col_audio = st.columns([1.5, 1])
+            with col_q:
+                yt_quality = st.selectbox("Target Resolution:", ["1080p Full HD", "4K UHD (2160p)", "720p HD"], index=0)
+            with col_audio:
+                st.write("")
+                mute_audio_val = st.checkbox("Mute Audio (Silent B-roll)", value=False)
 
-            st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
-            st.rerun()
+            clip_title = st.text_input("Clip Title / Filename:", value=f"yt_clip_{chosen_match['start_str'].replace(':', '_')}")
 
-    # Results View
-    if st.session_state.batch_results:
-        results = st.session_state.batch_results
-        successful = [r for r in results if r["ok"]]
-        failed = [r for r in results if not r["ok"]]
+            if st.button("✂️ **Trim & Download This Clip Now**", type="primary", use_container_width=True):
+                s_sec = time_to_seconds(start_ts_input)
+                e_sec = time_to_seconds(end_ts_input)
 
-        if successful:
-            st.markdown("### **Download Your Sourced Assets**")
+                if s_sec is None or e_sec is None or (e_sec - s_sec) <= 0:
+                    st.error("Invalid timestamps. End timestamp must be greater than start timestamp.")
+                else:
+                    clean_name = prompt_to_clean_filename(clip_title, "mp4")
+                    final_clip_path = os.path.join(OUTPUT_DIR, clean_name)
 
-            # Sequential Multi-Downloader via Blob Conversion
-            cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
+                    with st.spinner("Extracting precision segment from YouTube stream..."):
+                        t0 = time.time()
+                        ok_trim, trim_msg = trim_youtube_stream_slice(
+                            yt_url_input, s_sec, e_sec, final_clip_path, yt_quality, mute_audio_val
+                        )
+                        elapsed_trim = time.time() - t0
 
-            if cdn_links:
-                js_code = """
-                <script>
-                async function downloadOneByOne() {
-                    const links = """ + str(cdn_links) + """;
-                    const btn = document.getElementById('seqBtn');
-                    btn.disabled = true;
-                    btn.style.opacity = '0.6';
+                    if ok_trim and os.path.exists(final_clip_path):
+                        st.success(f"✓ Clip extracted successfully: `{clean_name}` ({trim_msg} in {elapsed_trim:.1f}s)")
 
-                    for (let i = 0; i < links.length; i++) {
-                        const item = links[i];
-                        btn.innerText = '⚡ Downloading (' + (i + 1) + '/' + links.length + ')...';
-                        try {
-                            const res = await fetch(item.url);
-                            const blob = await res.blob();
-                            const blobUrl = window.URL.createObjectURL(blob);
-                            const a = document.createElement('a');
-                            a.style.display = 'none';
-                            a.href = blobUrl;
-                            a.download = item.name;
-                            document.body.appendChild(a);
-                            a.click();
-                            window.URL.revokeObjectURL(blobUrl);
-                            document.body.removeChild(a);
-                        } catch (err) {
-                            const a = document.createElement('a');
-                            a.href = item.url;
-                            a.download = item.name;
-                            a.target = '_blank';
-                            document.body.appendChild(a);
-                            a.click();
-                            document.body.removeChild(a);
-                        }
-                        if (i < links.length - 1) {
-                            await new Promise(r => setTimeout(r, 2000));
-                        }
-                    }
+                        with open(final_clip_path, "rb") as cf:
+                            st.download_button(
+                                label=f"⬇️ **Download {clean_name} (.MP4)**",
+                                data=cf.read(),
+                                file_name=clean_name,
+                                mime="video/mp4",
+                                type="primary",
+                                use_container_width=True
+                            )
 
-                    btn.disabled = false;
-                    btn.style.opacity = '1';
-                    btn.innerText = '✓ All Files Downloaded!';
-                }
-                </script>
-                <div style="padding: 2px 0;">
-                    <button id="seqBtn" onclick="downloadOneByOne()" style="
-                        background: linear-gradient(135deg, #00C853 0%, #009624 100%);
-                        color: white;
-                        border: none;
-                        padding: 13px 20px;
-                        font-size: 15px;
-                        font-weight: 700;
-                        border-radius: 8px;
-                        cursor: pointer;
-                        width: 100%;
-                        margin-bottom: 6px;
-                        box-shadow: 0 4px 6px rgba(0,0,0,0.12);
-                    ">
-                        ⚡ Download One-by-One (2s Gap - Max Regional Speed)
-                    </button>
-                </div>
-                """
-                components.html(js_code, height=65)
+                        st.write("---")
+                        st.video(final_clip_path)
+                    else:
+                        st.error(f"✖ Trimming failed: {trim_msg}")
 
-            # Master ZIP Archive
-            if st.session_state.zip_bytes:
-                zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
-                st.download_button(
-                    label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
-                    data=st.session_state.zip_bytes,
-                    file_name="broll_assets.zip",
-                    mime="application/zip",
-                    type="primary",
-                    use_container_width=True
+    # =================================================================
+    # TOOL B: REPOSITORY SEARCH & BATCH SOURCING
+    # =================================================================
+    else:
+        auth_key_name = tool_info.get("auth_key")
+        if auth_key_name:
+            current_key = globals().get(auth_key_name, "")
+            if not current_key:
+                st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
+
+        quality_choice = "1080p Full HD"
+        clip_seconds = 10
+
+        if tool_info["type"] == "video":
+            col_q1, col_q2 = st.columns(2)
+            with col_q1:
+                st.markdown("**Clip Length**")
+                clip_label = st.selectbox(
+                    "Clip Length",
+                    ["10 Seconds (Default)", "15 Seconds", "Full Video Length"],
+                    index=0,
+                    label_visibility="collapsed"
+                )
+                if clip_label == "10 Seconds (Default)":
+                    clip_seconds = 10
+                elif clip_label == "15 Seconds":
+                    clip_seconds = 15
+                else:
+                    clip_seconds = None
+
+            with col_q2:
+                st.markdown("**Quality**")
+                quality_choice = st.selectbox(
+                    "Quality",
+                    ["1080p Full HD", "4K UHD (2160p)", "720p HD"],
+                    index=0,
+                    label_visibility="collapsed"
                 )
 
-        st.divider()
-        st.markdown("#### **Sourced File Status & Previews**")
+        st.markdown("**Visual Prompts (one prompt per line)**")
+        prompt_input = st.text_area(
+            "Visual Prompts",
+            height=160,
+            placeholder="wright brothers first flight kitty hawk\ncivil war battlefield photography\n1930s great depression street scene",
+            label_visibility="collapsed"
+        )
 
-        for r in failed:
-            st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
+        col_btn1, col_btn2 = st.columns([1.3, 1])
+        with col_btn1:
+            start_btn = st.button("⚡ **Start Fast Parallel Sourcing**", type="primary", use_container_width=True)
+        with col_btn2:
+            if st.session_state.batch_results:
+                if st.button("**Clear Results**", use_container_width=True):
+                    st.session_state.batch_results = []
+                    st.session_state.zip_bytes = None
+                    st.rerun()
 
-        for r in successful:
-            st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
-            col_prev, col_meta = st.columns([1.6, 1.2])
-            with col_prev:
-                if r["ext"] == "mp4" and os.path.exists(r["path"]):
-                    st.video(r["path"])
-                elif os.path.exists(r["path"]):
-                    st.image(r["path"], use_container_width=True)
-            with col_meta:
-                st.markdown(f"**Prompt:** {r['prompt']}")
-                st.markdown(f"**Filename:** `{r['filename']}`")
-                st.caption(f"File Size: {r['detail']}")
-                if r.get("cdn_url"):
-                    st.link_button("🌐 Open Source File", r["cdn_url"], use_container_width=True)
-            st.write("---")
+        if start_btn:
+            lines = [line.strip() for line in prompt_input.splitlines() if line.strip()]
+            if not lines:
+                st.warning("Please enter at least one visual prompt.")
+            else:
+                ext = tool_info["ext"]
+                st.session_state.batch_results = []
+                st.session_state.zip_bytes = None
+
+                with st.spinner(f"Fetching {len(lines)} asset(s) simultaneously from edge servers..."):
+                    t_all = time.time()
+
+                    with ThreadPoolExecutor(max_workers=min(len(lines), 8)) as executor:
+                        futures = [
+                            executor.submit(process_single_prompt, line, selected_tool_name, ext, quality_choice, clip_seconds)
+                            for line in lines
+                        ]
+                        results = [f.result() for f in futures]
+
+                    st.session_state.batch_results = results
+
+                    valid_paths = [r["path"] for r in results if r["ok"] and os.path.exists(r["path"])]
+                    if valid_paths:
+                        st.session_state.zip_bytes = create_in_memory_zip(valid_paths)
+
+                st.success(f"✓ Retrieved {len(valid_paths)} of {len(lines)} items in {time.time() - t_all:.1f}s total!")
+                st.rerun()
+
+        # Results View
+        if st.session_state.batch_results:
+            results = st.session_state.batch_results
+            successful = [r for r in results if r["ok"]]
+            failed = [r for r in results if not r["ok"]]
+
+            if successful:
+                st.markdown("### **Download Your Sourced Assets**")
+
+                cdn_links = [{"url": r["cdn_url"], "name": r["filename"]} for r in successful if r.get("cdn_url")]
+
+                if cdn_links:
+                    js_code = """
+                    <script>
+                    async function downloadOneByOne() {
+                        const links = """ + str(cdn_links) + """;
+                        const btn = document.getElementById('seqBtn');
+                        btn.disabled = true;
+                        btn.style.opacity = '0.6';
+
+                        for (let i = 0; i < links.length; i++) {
+                            const item = links[i];
+                            btn.innerText = '⚡ Downloading (' + (i + 1) + '/' + links.length + ')...';
+                            try {
+                                const res = await fetch(item.url);
+                                const blob = await res.blob();
+                                const blobUrl = window.URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.style.display = 'none';
+                                a.href = blobUrl;
+                                a.download = item.name;
+                                document.body.appendChild(a);
+                                a.click();
+                                window.URL.revokeObjectURL(blobUrl);
+                                document.body.removeChild(a);
+                            } catch (err) {
+                                const a = document.createElement('a');
+                                a.href = item.url;
+                                a.download = item.name;
+                                a.target = '_blank';
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                            }
+                            if (i < links.length - 1) {
+                                await new Promise(r => setTimeout(r, 2000));
+                            }
+                        }
+
+                        btn.disabled = false;
+                        btn.style.opacity = '1';
+                        btn.innerText = '✓ All Files Downloaded!';
+                    }
+                    </script>
+                    <div style="padding: 2px 0;">
+                        <button id="seqBtn" onclick="downloadOneByOne()" style="
+                            background: linear-gradient(135deg, #00C853 0%, #009624 100%);
+                            color: white;
+                            border: none;
+                            padding: 13px 20px;
+                            font-size: 15px;
+                            font-weight: 700;
+                            border-radius: 8px;
+                            cursor: pointer;
+                            width: 100%;
+                            margin-bottom: 6px;
+                            box-shadow: 0 4px 6px rgba(0,0,0,0.12);
+                        ">
+                            ⚡ Download One-by-One (2s Gap - Max Regional Speed)
+                        </button>
+                    </div>
+                    """
+                    components.html(js_code, height=65)
+
+                if st.session_state.zip_bytes:
+                    zip_mb = len(st.session_state.zip_bytes) / (1024 * 1024)
+                    st.download_button(
+                        label=f"📦 **Download All as Single Archive (.ZIP) — [{zip_mb:.1f} MB]**",
+                        data=st.session_state.zip_bytes,
+                        file_name="broll_assets.zip",
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+            st.divider()
+            st.markdown("#### **Sourced File Status & Previews**")
+
+            for r in failed:
+                st.error(f"✖ **Failed:** \"{r['prompt']}\" — {r['detail']}")
+
+            for r in successful:
+                st.success(f"✓ **Saved:** `{r['filename']}` — {r['detail']} (Fetched in {r['elapsed']:.1f}s)")
+                col_prev, col_meta = st.columns([1.6, 1.2])
+                with col_prev:
+                    if r["ext"] == "mp4" and os.path.exists(r["path"]):
+                        st.video(r["path"])
+                    elif os.path.exists(r["path"]):
+                        st.image(r["path"], use_container_width=True)
+                with col_meta:
+                    st.markdown(f"**Prompt:** {r['prompt']}")
+                    st.markdown(f"**Filename:** `{r['filename']}`")
+                    st.caption(f"File Size: {r['detail']}")
+                    if r.get("cdn_url"):
+                        st.link_button("🌐 Open Source File", r["cdn_url"], use_container_width=True)
+                st.write("---")
