@@ -1,6 +1,8 @@
 import os
 import re
 import io
+import time
+import uuid
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -44,13 +46,11 @@ def get_query_candidates(raw_prompt: str) -> list[str]:
     clean = re.sub(r"\s+", " ", clean)
     candidates = [clean]
 
-    # Candidate 2: Strip grammar fillers
     words = [w for w in clean.split() if w.lower() not in GRAMMAR_FILLERS]
     keyword_q = " ".join(words)
     if keyword_q and keyword_q != clean:
         candidates.append(keyword_q)
 
-    # Candidate 3: Core first 2-3 essential words
     if len(words) > 2:
         candidates.append(" ".join(words[:2]))
     if len(words) > 1 and words[0] not in candidates:
@@ -169,15 +169,15 @@ def trim_video_buffer(cdn_url: str, duration_sec: int | None = 10, target_height
     if duration_sec is None:
         return raw_bytes
 
-    pid_tag = f"{os.getpid()}_{time.time_ns()}"
-    temp_raw = os.path.join(OUTPUT_DIR, f"temp_raw_{pid_tag}.mp4")
-    temp_cut = os.path.join(OUTPUT_DIR, f"temp_cut_{pid_tag}.mp4")
+    unique_tag = uuid.uuid4().hex[:8]
+    temp_raw = os.path.join(OUTPUT_DIR, f"temp_raw_{unique_tag}.mp4")
+    temp_cut = os.path.join(OUTPUT_DIR, f"temp_cut_{unique_tag}.mp4")
 
     try:
         with open(temp_raw, "wb") as f:
             f.write(raw_bytes)
 
-        # Precise slice: limit duration, scale appropriately, and cap bitrate to ~4500k (keeping 10s under 6MB)
+        # Precise slice: limit duration, scale appropriately, and cap bitrate to ~4500k
         cmd = [
             FFMPEG_EXE, "-y",
             "-ss", "00:00:00",
