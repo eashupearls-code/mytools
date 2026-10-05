@@ -33,7 +33,6 @@ UNSPLASH_ACCESS_KEY = get_secret("UNSPLASH_ACCESS_KEY", "")
 OUTPUT_DIR = "downloaded_broll"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-MAX_WIKIMEDIA_SIZE_MB = 10.0
 GLOBAL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 # =====================================================================
@@ -43,7 +42,7 @@ TOOLS = {
     "Stock Video Footage (Pexels)": {
         "tag": "pexels_video",
         "ext": "mp4",
-        "desc": "High-bitrate cinematic modern b-roll, drone landscapes, highways, and commercial clips.",
+        "desc": "High-bitrate cinematic modern b-roll, drone landscapes, highways, and commercial transitions.",
         "type": "video",
         "auth_key": "PEXELS_API_KEY"
     },
@@ -57,7 +56,7 @@ TOOLS = {
     "Pixabay Video Footage": {
         "tag": "pixabay_video",
         "ext": "mp4",
-        "desc": "Diverse royalty-free nature scenes, slow motion wildlife, motion backgrounds, and time-lapses.",
+        "desc": "Diverse royalty-free nature scenes, slow motion wildlife, animated motion backgrounds, and time-lapses.",
         "type": "video",
         "auth_key": "PIXABAY_API_KEY"
     },
@@ -71,14 +70,14 @@ TOOLS = {
     "Unsplash Editorial Photos": {
         "tag": "unsplash_photo",
         "ext": "jpg",
-        "desc": "Award-winning artistic lighting, character portraits, street photography, and editorial framing.",
+        "desc": "Award-winning artistic lighting, dramatic character portraits, street photography, and editorial framing.",
         "type": "photo",
         "auth_key": "UNSPLASH_ACCESS_KEY"
     },
     "Wikimedia Commons Stills": {
         "tag": "wikimedia_still",
         "ext": "jpg",
-        "desc": "Public domain archive: antique maps, scientific diagrams, historical manuscripts, and art (≤ 10MB).",
+        "desc": "Public domain archive: antique cartography maps, scientific diagrams, manuscripts, and artwork.",
         "type": "photo",
         "auth_key": None
     },
@@ -99,7 +98,7 @@ TOOLS = {
     "iStock Photo Explorer (Search & Copy URL)": {
         "tag": "istock_search",
         "ext": "jpg",
-        "desc": "Search live iStock catalog by prompt, preview top 3 matches, and copy official URLs.",
+        "desc": "Search live iStock catalog by prompt, preview top 3 matches, and copy official URLs with 1-click.",
         "type": "catalog_explorer",
         "source": "istock",
         "auth_key": None
@@ -107,7 +106,7 @@ TOOLS = {
     "Shutterstock Photo Explorer (Search & Copy URL)": {
         "tag": "shutterstock_search",
         "ext": "jpg",
-        "desc": "Search live Shutterstock catalog by prompt, preview top 3 matches, and copy official URLs.",
+        "desc": "Search live Shutterstock catalog by prompt, preview top 3 matches, and copy official URLs with 1-click.",
         "type": "catalog_explorer",
         "source": "shutterstock",
         "auth_key": None
@@ -115,7 +114,7 @@ TOOLS = {
 }
 
 # =====================================================================
-# HELPER FUNCTIONS
+# STREAMING & TRIMMING UTILITIES
 # =====================================================================
 def prompt_to_clean_filename(prompt: str, ext: str, index: int = 1) -> str:
     clean = re.sub(r'[\\/*?:"<>|]', "", prompt)
@@ -125,14 +124,14 @@ def prompt_to_clean_filename(prompt: str, ext: str, index: int = 1) -> str:
     return f"{base_name}_{index}.{ext}"
 
 
-def download_media_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
+def fetch_direct_buffer(url: str, referer: str = "https://www.google.com/") -> bytes | None:
     headers = {
         "User-Agent": GLOBAL_USER_AGENT,
         "Referer": referer,
         "Accept": "*/*"
     }
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        r = requests.get(url, headers=headers, timeout=25)
         if r.status_code == 200 and len(r.content) > 1000:
             return r.content
     except Exception:
@@ -140,74 +139,171 @@ def download_media_buffer(url: str, referer: str = "https://www.google.com/") ->
     return None
 
 
-def trim_video_stream(cdn_url: str, duration_sec: int = 10) -> bytes | None:
-    temp_in = os.path.join(OUTPUT_DIR, "temp_in.mp4")
-    temp_out = os.path.join(OUTPUT_DIR, "temp_out.mp4")
-    
-    # Download buffer to temp
-    content = download_media_buffer(cdn_url)
-    if not content:
-        return None
-        
-    with open(temp_in, "wb") as f:
-        f.write(content)
+def trim_video_buffer(cdn_url: str, duration_sec: int | None = 10) -> bytes | None:
+    # 1. Download full or partial stream safely to memory
+    raw_bytes = fetch_direct_buffer(cdn_url)
+    if not raw_bytes or duration_sec is None:
+        return raw_bytes
 
-    cmd = [
-        FFMPEG_EXE, "-y",
-        "-ss", "00:00:00",
-        "-i", temp_in,
-        "-t", str(duration_sec),
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        temp_out
-    ]
+    temp_raw = os.path.join(OUTPUT_DIR, f"temp_raw_{os.getpid()}.mp4")
+    temp_cut = os.path.join(OUTPUT_DIR, f"temp_cut_{os.getpid()}.mp4")
+
     try:
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
-        if os.path.exists(temp_out) and os.path.getsize(temp_out) > 1000:
-            with open(temp_out, "rb") as f:
-                sliced_bytes = f.read()
-            return sliced_bytes
+        with open(temp_raw, "wb") as f:
+            f.write(raw_bytes)
+
+        cmd = [
+            FFMPEG_EXE, "-y",
+            "-ss", "00:00:00",
+            "-i", temp_raw,
+            "-t", str(duration_sec),
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "22",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            temp_cut
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+
+        if os.path.exists(temp_cut) and os.path.getsize(temp_cut) > 1000:
+            with open(temp_cut, "rb") as f:
+                return f.read()
     except Exception:
         pass
     finally:
-        for p in (temp_in, temp_out):
+        for p in (temp_raw, temp_cut):
             if os.path.exists(p):
                 try:
                     os.remove(p)
                 except Exception:
                     pass
-    return content
+
+    return raw_bytes
 
 # =====================================================================
-# SEARCH ENGINES (TOP 3 FETCHER)
+# SEARCH FUNCTIONS WITH RESOLUTION & QUALITY SELECTION
 # =====================================================================
-def fetch_top3_pexels_video(query: str) -> list[dict]:
+def fetch_top3_pexels_video(query: str, quality_choice: str = "1080p Full HD", clip_seconds: int | None = 10) -> list[dict]:
     if not PEXELS_API_KEY:
         return []
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "orientation": "landscape", "per_page": 3}
+    params = {"query": query, "orientation": "landscape", "per_page": 4}
     results = []
     try:
         r = requests.get(url, headers=headers, params=params, timeout=12)
-        for v in r.json().get("videos", []):
+        videos = r.json().get("videos", [])
+        for v in videos:
             files = [f for f in v.get("video_files", []) if f.get("link")]
             files.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-            chosen = next((f for f in files if (f.get("height") or 0) <= 1080), files[0]) if files else None
+
+            chosen = None
+            if quality_choice == "4K UHD (2160p)":
+                chosen = next((f for f in files if (f.get("height") or 0) >= 2160 or (f.get("width") or 0) >= 3840), None)
+            elif quality_choice == "720p HD":
+                chosen = next((f for f in files if (f.get("height") or 0) == 720 or (f.get("width") or 0) == 1280), None)
+
+            if not chosen:
+                chosen = next((f for f in files if (f.get("height") or 0) == 1080 or (f.get("width") or 0) == 1920), None)
+            if not chosen and files:
+                chosen = files[0]
+
             if chosen:
+                cdn_url = chosen["link"]
+                # Pre-trim to memory buffer so the download button works instantly
+                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
                 results.append({
                     "title": f"Pexels Video {v.get('id')}",
-                    "stream_url": chosen["link"],
+                    "media_bytes": trimmed_data,
+                    "stream_url": cdn_url,
                     "page_url": v.get("url")
                 })
+            if len(results) == 3:
+                break
     except Exception:
         pass
     return results
 
 
-def fetch_top3_pexels_photo(query: str) -> list[dict]:
+def fetch_top3_pixabay_video(query: str, quality_choice: str = "1080p Full HD", clip_seconds: int | None = 10) -> list[dict]:
+    if not PIXABAY_API_KEY:
+        return []
+    url = "https://pixabay.com/api/videos/"
+    params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 4}
+    results = []
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        hits = r.json().get("hits", [])
+        for hit in hits:
+            streams = hit.get("videos", {})
+            chosen = None
+
+            if quality_choice == "4K UHD (2160p)":
+                large = streams.get("large", {})
+                if (large.get("height") or 0) >= 1440:
+                    chosen = large
+            elif quality_choice == "720p HD":
+                medium = streams.get("medium", {})
+                if (medium.get("height") or 0) == 720:
+                    chosen = medium
+
+            if not chosen or not chosen.get("url"):
+                chosen = streams.get("large") or streams.get("medium") or streams.get("small")
+
+            if chosen and chosen.get("url"):
+                cdn_url = chosen["url"]
+                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
+                results.append({
+                    "title": hit.get("tags") or "Pixabay B-Roll Video",
+                    "media_bytes": trimmed_data,
+                    "stream_url": cdn_url,
+                    "page_url": hit.get("pageURL")
+                })
+            if len(results) == 3:
+                break
+    except Exception:
+        pass
+    return results
+
+
+def fetch_top3_loc_video(query: str, _q: str = "", clip_seconds: int | None = 10) -> list[dict]:
+    url = "https://www.loc.gov/film-and-videos/"
+    params = {"q": query, "fo": "json", "fa": "online-format:video", "c": 6}
+    results = []
+    try:
+        r = requests.get(url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=15)
+        for item in r.json().get("results", []):
+            item_id = item.get("id")
+            if not item_id:
+                continue
+            m_res = requests.get(f"{item_id}?fo=json", headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
+            if m_res.status_code == 200:
+                for res in m_res.json().get("resources", []):
+                    for grp in res.get("files", []):
+                        for f in grp:
+                            if f.get("url", "").endswith(".mp4"):
+                                cdn_url = f["url"]
+                                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
+                                results.append({
+                                    "title": item.get("title") or "Library of Congress Film",
+                                    "media_bytes": trimmed_data,
+                                    "stream_url": cdn_url,
+                                    "page_url": item_id
+                                })
+                                break
+                        if len(results) == 3:
+                            break
+                    if len(results) == 3:
+                        break
+            if len(results) == 3:
+                break
+    except Exception:
+        pass
+    return results
+
+
+def fetch_top3_pexels_photo(query: str, *args) -> list[dict]:
     if not PEXELS_API_KEY:
         return []
     url = "https://api.pexels.com/v1/search"
@@ -219,11 +315,11 @@ def fetch_top3_pexels_photo(query: str) -> list[dict]:
         for p in r.json().get("photos", []):
             src = p.get("src", {})
             u = src.get("large2x") or src.get("large") or src.get("original")
-            b = download_media_buffer(u)
+            b = fetch_direct_buffer(u)
             if b:
                 results.append({
                     "title": p.get("alt") or f"Pexels Still {p.get('id')}",
-                    "image_bytes": b,
+                    "media_bytes": b,
                     "page_url": p.get("url")
                 })
     except Exception:
@@ -231,29 +327,7 @@ def fetch_top3_pexels_photo(query: str) -> list[dict]:
     return results
 
 
-def fetch_top3_pixabay_video(query: str) -> list[dict]:
-    if not PIXABAY_API_KEY:
-        return []
-    url = "https://pixabay.com/api/videos/"
-    params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 3}
-    results = []
-    try:
-        r = requests.get(url, params=params, timeout=12)
-        for hit in r.json().get("hits", []):
-            streams = hit.get("videos", {})
-            chosen = streams.get("large") or streams.get("medium") or streams.get("small")
-            if chosen and chosen.get("url"):
-                results.append({
-                    "title": hit.get("tags") or "Pixabay B-Roll Video",
-                    "stream_url": chosen["url"],
-                    "page_url": hit.get("pageURL")
-                })
-    except Exception:
-        pass
-    return results
-
-
-def fetch_top3_pixabay_photo(query: str) -> list[dict]:
+def fetch_top3_pixabay_photo(query: str, *args) -> list[dict]:
     if not PIXABAY_API_KEY:
         return []
     url = "https://pixabay.com/api/"
@@ -263,11 +337,11 @@ def fetch_top3_pixabay_photo(query: str) -> list[dict]:
         r = requests.get(url, params=params, timeout=12)
         for hit in r.json().get("hits", []):
             u = hit.get("largeImageURL") or hit.get("webformatURL")
-            b = download_media_buffer(u)
+            b = fetch_direct_buffer(u)
             if b:
                 results.append({
                     "title": hit.get("tags") or "Pixabay Photo",
-                    "image_bytes": b,
+                    "media_bytes": b,
                     "page_url": hit.get("pageURL")
                 })
     except Exception:
@@ -275,7 +349,7 @@ def fetch_top3_pixabay_photo(query: str) -> list[dict]:
     return results
 
 
-def fetch_top3_unsplash_photo(query: str) -> list[dict]:
+def fetch_top3_unsplash_photo(query: str, *args) -> list[dict]:
     if not UNSPLASH_ACCESS_KEY:
         return []
     url = "https://api.unsplash.com/search/photos"
@@ -286,11 +360,11 @@ def fetch_top3_unsplash_photo(query: str) -> list[dict]:
         r = requests.get(url, headers=headers, params=params, timeout=12)
         for p in r.json().get("results", []):
             u = p["urls"].get("regular") or p["urls"].get("full")
-            b = download_media_buffer(u)
+            b = fetch_direct_buffer(u)
             if b:
                 results.append({
                     "title": p.get("alt_description") or "Unsplash Editorial Still",
-                    "image_bytes": b,
+                    "media_bytes": b,
                     "page_url": p.get("links", {}).get("html")
                 })
     except Exception:
@@ -298,7 +372,7 @@ def fetch_top3_unsplash_photo(query: str) -> list[dict]:
     return results
 
 
-def fetch_top3_wikimedia_stills(query: str) -> list[dict]:
+def fetch_top3_wikimedia_stills(query: str, *args) -> list[dict]:
     url = "https://commons.wikimedia.org/w/api.php"
     params = {
         "action": "query",
@@ -320,11 +394,11 @@ def fetch_top3_wikimedia_stills(query: str) -> list[dict]:
             if not infos:
                 continue
             u = infos[0].get("thumburl") or infos[0].get("url")
-            b = download_media_buffer(u)
+            b = fetch_direct_buffer(u)
             if b:
                 results.append({
                     "title": page.get("title", "").replace("File:", ""),
-                    "image_bytes": b,
+                    "media_bytes": b,
                     "page_url": infos[0].get("descriptionurl") or u
                 })
             if len(results) == 3:
@@ -334,41 +408,7 @@ def fetch_top3_wikimedia_stills(query: str) -> list[dict]:
     return results
 
 
-def fetch_top3_loc_video(query: str) -> list[dict]:
-    url = "https://www.loc.gov/film-and-videos/"
-    params = {"q": query, "fo": "json", "fa": "online-format:video", "c": 6}
-    results = []
-    try:
-        r = requests.get(url, params=params, headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=15)
-        hits = r.json().get("results", [])
-        for item in hits:
-            item_id = item.get("id")
-            if not item_id:
-                continue
-            m_res = requests.get(f"{item_id}?fo=json", headers={"User-Agent": GLOBAL_USER_AGENT}, timeout=10)
-            if m_res.status_code == 200:
-                for res in m_res.json().get("resources", []):
-                    for grp in res.get("files", []):
-                        for f in grp:
-                            if f.get("url", "").endswith(".mp4"):
-                                results.append({
-                                    "title": item.get("title") or "Library of Congress Film",
-                                    "stream_url": f["url"],
-                                    "page_url": item_id
-                                })
-                                break
-                        if len(results) == 3:
-                            break
-                    if len(results) == 3:
-                        break
-            if len(results) == 3:
-                break
-    except Exception:
-        pass
-    return results
-
-
-def fetch_top3_loc_photo(query: str) -> list[dict]:
+def fetch_top3_loc_photo(query: str, *args) -> list[dict]:
     url = "https://www.loc.gov/photos/"
     params = {"q": query, "fo": "json", "fa": "online-format:image", "c": 6}
     results = []
@@ -380,11 +420,11 @@ def fetch_top3_loc_photo(query: str) -> list[dict]:
             if chosen:
                 if chosen.startswith("//"):
                     chosen = "https:" + chosen
-                b = download_media_buffer(chosen)
+                b = fetch_direct_buffer(chosen)
                 if b:
                     results.append({
                         "title": item.get("title") or "Library of Congress Photo",
-                        "image_bytes": b,
+                        "media_bytes": b,
                         "page_url": item.get("id") or chosen
                     })
             if len(results) == 3:
@@ -394,7 +434,7 @@ def fetch_top3_loc_photo(query: str) -> list[dict]:
     return results
 
 
-def search_istock_top3(query: str) -> list[dict]:
+def search_istock_top3(query: str, *args) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     url = f"https://www.istockphoto.com/search/2/image?phrase={clean_q}&sort=mostpopular"
     headers = {
@@ -413,11 +453,11 @@ def search_istock_top3(query: str) -> list[dict]:
             )
             for page_path, thumb_url, alt_text in matches:
                 full_page_url = f"https://www.istockphoto.com{page_path}" if not page_path.startswith("http") else page_path
-                img_data = download_media_buffer(thumb_url, referer="https://www.istockphoto.com/")
+                img_data = fetch_direct_buffer(thumb_url, referer="https://www.istockphoto.com/")
                 if img_data:
                     results.append({
                         "title": alt_text.strip() or "iStock Photo",
-                        "image_bytes": img_data,
+                        "media_bytes": img_data,
                         "target_url": full_page_url
                     })
                 if len(results) == 3:
@@ -427,7 +467,7 @@ def search_istock_top3(query: str) -> list[dict]:
     return results
 
 
-def search_shutterstock_top3(query: str) -> list[dict]:
+def search_shutterstock_top3(query: str, *args) -> list[dict]:
     clean_q = requests.utils.quote(query.strip())
     results = []
     api_url = f"https://www.shutterstock.com/_next/data/en/search/{clean_q}.json?term={clean_q}"
@@ -445,17 +485,13 @@ def search_shutterstock_top3(query: str) -> list[dict]:
                 img_id = item.get("id")
                 desc = item.get("description", "Shutterstock Photo")
                 displays = item.get("displays", {})
-                thumb_url = (
-                    displays.get("260nw", {}).get("src")
-                    or displays.get("preview", {}).get("src")
-                    or displays.get("1500w", {}).get("src")
-                )
+                thumb_url = displays.get("260nw", {}).get("src") or displays.get("preview", {}).get("src")
                 if img_id and thumb_url:
-                    img_data = download_media_buffer(thumb_url, referer="https://www.shutterstock.com/")
+                    img_data = fetch_direct_buffer(thumb_url, referer="https://www.shutterstock.com/")
                     if img_data:
                         results.append({
                             "title": desc,
-                            "image_bytes": img_data,
+                            "media_bytes": img_data,
                             "target_url": f"https://www.shutterstock.com/image-photo/{img_id}"
                         })
                 if len(results) == 3:
@@ -500,7 +536,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Authentication gatekeeper
+# Security login
 if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
 
@@ -527,24 +563,24 @@ if not st.session_state.authenticated:
                     st.error("Incorrect Username or Password. Access Denied.")
     st.stop()
 
-# State memory
-if "results" not in st.session_state:
-    st.session_state.results = []
-if "last_query" not in st.session_state:
-    st.session_state.last_query = ""
-if "last_tool" not in st.session_state:
-    st.session_state.last_tool = ""
+# Cache initialization
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
+if "active_query" not in st.session_state:
+    st.session_state.active_query = ""
+if "active_tool" not in st.session_state:
+    st.session_state.active_tool = ""
 
 # Header
 col_header, col_logout = st.columns([4, 1])
 with col_header:
     st.markdown("# 🎬 **Automation Tools By Shoaib Malik**")
-    st.caption("⚡ Live Single Query Sourcing: Top 3 Results with Direct Downloads")
+    st.caption("⚡ Live Single Query Sourcing: Top 3 Results with Instant Downloads")
 with col_logout:
     st.write("")
     if st.button("🔒 **Log Out**", use_container_width=True):
         st.session_state.authenticated = False
-        st.session_state.results = []
+        st.session_state.search_results = []
         st.rerun()
 
 st.divider()
@@ -562,10 +598,11 @@ with col_nav:
 
 tool_info = TOOLS[selected_tool_name]
 
-if st.session_state.last_tool != selected_tool_name:
-    st.session_state.results = []
-    st.session_state.last_query = ""
-    st.session_state.last_tool = selected_tool_name
+# Reset results if user switches tools
+if st.session_state.active_tool != selected_tool_name:
+    st.session_state.search_results = []
+    st.session_state.active_query = ""
+    st.session_state.active_tool = selected_tool_name
 
 with col_main:
     st.markdown(f"### **Tool: {selected_tool_name}**")
@@ -573,14 +610,47 @@ with col_main:
 
     auth_key_name = tool_info.get("auth_key")
     if auth_key_name and not globals().get(auth_key_name, ""):
-        st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets.")
+        st.warning(f"⚠️ `{auth_key_name}` is not configured in your Streamlit Secrets vault.")
 
-    # Search Bar Row
+    # Quality & Clip Controls (Video tools only)
+    quality_choice = "1080p Full HD"
+    clip_seconds = 10
+
+    if tool_info["type"] == "video":
+        col_ctl1, col_ctl2 = st.columns(2)
+        with col_ctl1:
+            st.markdown("**Clip Duration**")
+            clip_label = st.selectbox(
+                "Clip Duration",
+                ["10 Seconds (Default)", "15 Seconds", "Full Video Length"],
+                index=0,
+                key="ctrl_duration",
+                label_visibility="collapsed"
+            )
+            if clip_label == "10 Seconds (Default)":
+                clip_seconds = 10
+            elif clip_label == "15 Seconds":
+                clip_seconds = 15
+            else:
+                clip_seconds = None
+
+        with col_ctl2:
+            st.markdown("**Video Quality**")
+            quality_choice = st.selectbox(
+                "Video Quality",
+                ["1080p Full HD", "4K UHD (2160p)", "720p HD"],
+                index=0,
+                key="ctrl_quality",
+                label_visibility="collapsed"
+            )
+
+    # Search Bar
+    st.markdown("**Search Prompt**")
     col_input, col_action = st.columns([3, 1])
     with col_input:
         search_prompt = st.text_input(
-            "Visual Search Prompt:",
-            placeholder="e.g. golden gate bridge drone, moody foggy forest, corporate boardroom handshake",
+            "Visual Search Prompt",
+            placeholder="e.g. golden gate bridge drone, moody foggy forest road, corporate handshake",
             label_visibility="collapsed"
         )
     with col_action:
@@ -588,35 +658,39 @@ with col_main:
 
     if run_search:
         if not search_prompt.strip():
-            st.warning("Please enter a visual search prompt.")
+            st.warning("Please enter a search prompt.")
         else:
-            st.session_state.last_query = search_prompt.strip()
+            st.session_state.active_query = search_prompt.strip()
             with st.spinner(f"Fetching top 3 results from {selected_tool_name}..."):
                 fetcher = TOOL_DISPATCHER[selected_tool_name]
-                hits = fetcher(search_prompt.strip())
-                st.session_state.results = hits
+                hits = fetcher(search_prompt.strip(), quality_choice, clip_seconds)
+                st.session_state.search_results = hits
 
             if not hits:
                 st.error(f"No results found for '{search_prompt}'. Try broader keywords.")
             else:
                 st.success(f"✓ Found top {len(hits)} matches!")
 
-    # Top 3 Results Rendering Row
-    if st.session_state.results:
+    # Display Results in a Row of 3
+    if st.session_state.search_results:
         st.markdown("---")
-        st.markdown(f"#### **Top 3 Results for: *\"{st.session_state.last_query}\"***")
+        st.markdown(f"#### **Top 3 Results for: *\"{st.session_state.active_query}\"***")
 
-        hits = st.session_state.results[:3]
+        hits = st.session_state.search_results[:3]
         cols = st.columns(3)
 
         for idx, item in enumerate(hits):
             with cols[idx]:
                 title = item.get("title", f"Result #{idx+1}")
-                clean_title = (title[:38] + "...") if len(title) > 38 else title
+                clean_title = (title[:36] + "...") if len(title) > 36 else title
+                media_bytes = item.get("media_bytes")
+                ext = tool_info["ext"]
+                filename = prompt_to_clean_filename(st.session_state.active_query, ext, idx + 1)
 
                 # 1. CATALOG EXPLORER (iStock & Shutterstock)
                 if tool_info["type"] == "catalog_explorer":
-                    st.image(item["image_bytes"], use_container_width=True)
+                    if media_bytes:
+                        st.image(media_bytes, use_container_width=True)
                     st.caption(f"**{clean_title}**")
                     raw_url = item.get("target_url", "")
                     
@@ -646,50 +720,41 @@ with col_main:
 
                 # 2. PHOTO MEDIA TOOLS
                 elif tool_info["type"] == "photo":
-                    st.image(item["image_bytes"], use_container_width=True)
-                    st.caption(f"**{clean_title}**")
-                    filename = prompt_to_clean_filename(st.session_state.last_query, "jpg", idx + 1)
-                    
-                    st.download_button(
-                        label=f"⬇️ **Download Photo #{idx+1}**",
-                        data=item["image_bytes"],
-                        file_name=filename,
-                        mime="image/jpeg",
-                        key=f"dl_photo_{idx}",
-                        type="primary" if idx == 0 else "secondary",
-                        use_container_width=True
-                    )
+                    if media_bytes:
+                        st.image(media_bytes, use_container_width=True)
+                        st.caption(f"**{clean_title}**")
+                        
+                        st.download_button(
+                            label=f"⬇️ **Download Photo #{idx+1}**",
+                            data=media_bytes,
+                            file_name=filename,
+                            mime="image/jpeg",
+                            key=f"dl_btn_photo_{idx}",
+                            type="primary" if idx == 0 else "secondary",
+                            use_container_width=True
+                        )
                     if item.get("page_url"):
                         st.link_button("🌐 Open Source", item["page_url"], use_container_width=True)
 
                 # 3. VIDEO MEDIA TOOLS
                 elif tool_info["type"] == "video":
-                    st.video(item["stream_url"])
-                    st.caption(f"**{clean_title}**")
-                    filename = prompt_to_clean_filename(st.session_state.last_query, "mp4", idx + 1)
-                    stream_url = item["stream_url"]
+                    if media_bytes:
+                        st.video(media_bytes)
+                        st.caption(f"**{clean_title}**")
 
-                    # Action buttons
-                    col_b1, col_b2 = st.columns(2)
-                    with col_b1:
-                        if st.button(f"✂️ Slice 10s", key=f"slice_btn_{idx}", use_container_width=True):
-                            with st.spinner("Trimming 10s MP4..."):
-                                trimmed_data = trim_video_stream(stream_url, duration_sec=10)
-                                if trimmed_data:
-                                    st.session_state[f"video_bytes_{idx}"] = trimmed_data
-                                else:
-                                    st.error("Failed to slice.")
+                        st.download_button(
+                            label=f"⬇️ **Save Video #{idx+1} ({quality_choice})**",
+                            data=media_bytes,
+                            file_name=filename,
+                            mime="video/mp4",
+                            key=f"dl_btn_vid_{idx}",
+                            type="primary" if idx == 0 else "secondary",
+                            use_container_width=True
+                        )
+                    elif item.get("stream_url"):
+                        st.video(item["stream_url"])
+                        st.caption(f"**{clean_title}**")
+                        st.warning("Video streaming only; download buffer unavailable.")
 
-                        if f"video_bytes_{idx}" in st.session_state:
-                            st.download_button(
-                                label=f"⬇️ Save 10s MP4",
-                                data=st.session_state[f"video_bytes_{idx}"],
-                                file_name=f"10s_{filename}",
-                                mime="video/mp4",
-                                key=f"dl_video_slice_{idx}",
-                                type="primary",
-                                use_container_width=True
-                            )
-
-                    with col_b2:
-                        st.link_button("🌐 Full File", stream_url, use_container_width=True)
+                    if item.get("page_url"):
+                        st.link_button("🌐 Source Link", item["page_url"], use_container_width=True)
