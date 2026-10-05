@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Locate FFmpeg
+# Locate FFmpeg reliably
 try:
     import imageio_ffmpeg
     FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
@@ -42,7 +42,7 @@ TOOLS = {
     "Stock Video Footage (Pexels)": {
         "tag": "pexels_video",
         "ext": "mp4",
-        "desc": "High-bitrate cinematic modern b-roll, drone landscapes, highways, and commercial transitions.",
+        "desc": "High-bitrate cinematic modern b-roll, drone landscapes, highways, and commercial clips.",
         "type": "video",
         "auth_key": "PEXELS_API_KEY"
     },
@@ -56,7 +56,7 @@ TOOLS = {
     "Pixabay Video Footage": {
         "tag": "pixabay_video",
         "ext": "mp4",
-        "desc": "Diverse royalty-free nature scenes, slow motion wildlife, animated motion backgrounds, and time-lapses.",
+        "desc": "Diverse royalty-free nature scenes, slow motion wildlife, motion backgrounds, and time-lapses.",
         "type": "video",
         "auth_key": "PIXABAY_API_KEY"
     },
@@ -70,7 +70,7 @@ TOOLS = {
     "Unsplash Editorial Photos": {
         "tag": "unsplash_photo",
         "ext": "jpg",
-        "desc": "Award-winning artistic lighting, dramatic character portraits, street photography, and editorial framing.",
+        "desc": "Award-winning artistic lighting, character portraits, street photography, and editorial framing.",
         "type": "photo",
         "auth_key": "UNSPLASH_ACCESS_KEY"
     },
@@ -139,32 +139,38 @@ def fetch_direct_buffer(url: str, referer: str = "https://www.google.com/") -> b
     return None
 
 
-def trim_video_buffer(cdn_url: str, duration_sec: int | None = 10) -> bytes | None:
-    # 1. Download full or partial stream safely to memory
+def trim_video_buffer(cdn_url: str, duration_sec: int | None = 10, target_height: int = 1080) -> bytes | None:
     raw_bytes = fetch_direct_buffer(cdn_url)
-    if not raw_bytes or duration_sec is None:
+    if not raw_bytes:
+        return None
+    if duration_sec is None:
         return raw_bytes
 
-    temp_raw = os.path.join(OUTPUT_DIR, f"temp_raw_{os.getpid()}.mp4")
-    temp_cut = os.path.join(OUTPUT_DIR, f"temp_cut_{os.getpid()}.mp4")
+    temp_raw = os.path.join(OUTPUT_DIR, f"temp_raw_{os.getpid()}_{time.time_ns()}.mp4")
+    temp_cut = os.path.join(OUTPUT_DIR, f"temp_cut_{os.getpid()}_{time.time_ns()}.mp4")
 
     try:
         with open(temp_raw, "wb") as f:
             f.write(raw_bytes)
 
+        # Precise slice, resolution downscale, and bitrate cap (~4.5 Mbps) to guarantee 10s stays under 6MB
         cmd = [
             FFMPEG_EXE, "-y",
             "-ss", "00:00:00",
             "-i", temp_raw,
             "-t", str(duration_sec),
+            "-vf", f"scale=-2:'min({target_height},ih)'",
             "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", "22",
+            "-preset", "veryfast",
+            "-b:v", "4500k",
+            "-maxrate", "5000k",
+            "-bufsize", "10000k",
             "-c:a", "aac",
+            "-b:a", "128k",
             "-movflags", "+faststart",
             temp_cut
         ]
-        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
 
         if os.path.exists(temp_cut) and os.path.getsize(temp_cut) > 1000:
             with open(temp_cut, "rb") as f:
@@ -179,7 +185,7 @@ def trim_video_buffer(cdn_url: str, duration_sec: int | None = 10) -> bytes | No
                 except Exception:
                     pass
 
-    return raw_bytes
+    return None
 
 # =====================================================================
 # SEARCH FUNCTIONS WITH RESOLUTION & QUALITY SELECTION
@@ -189,36 +195,34 @@ def fetch_top3_pexels_video(query: str, quality_choice: str = "1080p Full HD", c
         return []
     url = "https://api.pexels.com/videos/search"
     headers = {"Authorization": PEXELS_API_KEY}
-    params = {"query": query, "orientation": "landscape", "per_page": 4}
+    params = {"query": query, "orientation": "landscape", "per_page": 6}
     results = []
+
+    target_h = 1080
+    if "4K" in quality_choice:
+        target_h = 2160
+    elif "720p" in quality_choice:
+        target_h = 720
+
     try:
         r = requests.get(url, headers=headers, params=params, timeout=12)
         videos = r.json().get("videos", [])
         for v in videos:
             files = [f for f in v.get("video_files", []) if f.get("link")]
-            files.sort(key=lambda x: (x.get("height") or 0), reverse=True)
-
-            chosen = None
-            if quality_choice == "4K UHD (2160p)":
-                chosen = next((f for f in files if (f.get("height") or 0) >= 2160 or (f.get("width") or 0) >= 3840), None)
-            elif quality_choice == "720p HD":
-                chosen = next((f for f in files if (f.get("height") or 0) == 720 or (f.get("width") or 0) == 1280), None)
-
-            if not chosen:
-                chosen = next((f for f in files if (f.get("height") or 0) == 1080 or (f.get("width") or 0) == 1920), None)
-            if not chosen and files:
-                chosen = files[0]
+            # Sort ascending by difference from target resolution
+            files.sort(key=lambda x: abs((x.get("height") or 0) - target_h))
+            chosen = files[0] if files else None
 
             if chosen:
                 cdn_url = chosen["link"]
-                # Pre-trim to memory buffer so the download button works instantly
-                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
-                results.append({
-                    "title": f"Pexels Video {v.get('id')}",
-                    "media_bytes": trimmed_data,
-                    "stream_url": cdn_url,
-                    "page_url": v.get("url")
-                })
+                trimmed_data = trim_video_buffer(cdn_url, clip_seconds, target_height=target_h)
+                if trimmed_data:
+                    results.append({
+                        "title": f"Pexels Video {v.get('id')}",
+                        "media_bytes": trimmed_data,
+                        "stream_url": cdn_url,
+                        "page_url": v.get("url")
+                    })
             if len(results) == 3:
                 break
     except Exception:
@@ -230,8 +234,15 @@ def fetch_top3_pixabay_video(query: str, quality_choice: str = "1080p Full HD", 
     if not PIXABAY_API_KEY:
         return []
     url = "https://pixabay.com/api/videos/"
-    params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 4}
+    params = {"key": PIXABAY_API_KEY, "q": query, "per_page": 6}
     results = []
+
+    target_h = 1080
+    if "4K" in quality_choice:
+        target_h = 2160
+    elif "720p" in quality_choice:
+        target_h = 720
+
     try:
         r = requests.get(url, params=params, timeout=12)
         hits = r.json().get("hits", [])
@@ -239,27 +250,23 @@ def fetch_top3_pixabay_video(query: str, quality_choice: str = "1080p Full HD", 
             streams = hit.get("videos", {})
             chosen = None
 
-            if quality_choice == "4K UHD (2160p)":
-                large = streams.get("large", {})
-                if (large.get("height") or 0) >= 1440:
-                    chosen = large
-            elif quality_choice == "720p HD":
-                medium = streams.get("medium", {})
-                if (medium.get("height") or 0) == 720:
-                    chosen = medium
-
-            if not chosen or not chosen.get("url"):
+            if target_h >= 2160 and streams.get("large", {}).get("url"):
+                chosen = streams["large"]
+            elif target_h == 720 and streams.get("medium", {}).get("url"):
+                chosen = streams["medium"]
+            else:
                 chosen = streams.get("large") or streams.get("medium") or streams.get("small")
 
             if chosen and chosen.get("url"):
                 cdn_url = chosen["url"]
-                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
-                results.append({
-                    "title": hit.get("tags") or "Pixabay B-Roll Video",
-                    "media_bytes": trimmed_data,
-                    "stream_url": cdn_url,
-                    "page_url": hit.get("pageURL")
-                })
+                trimmed_data = trim_video_buffer(cdn_url, clip_seconds, target_height=target_h)
+                if trimmed_data:
+                    results.append({
+                        "title": hit.get("tags") or "Pixabay B-Roll Video",
+                        "media_bytes": trimmed_data,
+                        "stream_url": cdn_url,
+                        "page_url": hit.get("pageURL")
+                    })
             if len(results) == 3:
                 break
     except Exception:
@@ -267,7 +274,7 @@ def fetch_top3_pixabay_video(query: str, quality_choice: str = "1080p Full HD", 
     return results
 
 
-def fetch_top3_loc_video(query: str, _q: str = "", clip_seconds: int | None = 10) -> list[dict]:
+def fetch_top3_loc_video(query: str, quality_choice: str = "1080p Full HD", clip_seconds: int | None = 10) -> list[dict]:
     url = "https://www.loc.gov/film-and-videos/"
     params = {"q": query, "fo": "json", "fa": "online-format:video", "c": 6}
     results = []
@@ -284,13 +291,14 @@ def fetch_top3_loc_video(query: str, _q: str = "", clip_seconds: int | None = 10
                         for f in grp:
                             if f.get("url", "").endswith(".mp4"):
                                 cdn_url = f["url"]
-                                trimmed_data = trim_video_buffer(cdn_url, clip_seconds)
-                                results.append({
-                                    "title": item.get("title") or "Library of Congress Film",
-                                    "media_bytes": trimmed_data,
-                                    "stream_url": cdn_url,
-                                    "page_url": item_id
-                                })
+                                trimmed_data = trim_video_buffer(cdn_url, clip_seconds, target_height=1080)
+                                if trimmed_data:
+                                    results.append({
+                                        "title": item.get("title") or "Library of Congress Film",
+                                        "media_bytes": trimmed_data,
+                                        "stream_url": cdn_url,
+                                        "page_url": item_id
+                                    })
                                 break
                         if len(results) == 3:
                             break
@@ -485,7 +493,11 @@ def search_shutterstock_top3(query: str, *args) -> list[dict]:
                 img_id = item.get("id")
                 desc = item.get("description", "Shutterstock Photo")
                 displays = item.get("displays", {})
-                thumb_url = displays.get("260nw", {}).get("src") or displays.get("preview", {}).get("src")
+                thumb_url = (
+                    displays.get("260nw", {}).get("src")
+                    or displays.get("preview", {}).get("src")
+                    or displays.get("1500w", {}).get("src")
+                )
                 if img_id and thumb_url:
                     img_data = fetch_direct_buffer(thumb_url, referer="https://www.shutterstock.com/")
                     if img_data:
@@ -598,7 +610,7 @@ with col_nav:
 
 tool_info = TOOLS[selected_tool_name]
 
-# Reset results if user switches tools
+# Reset results if switching tools
 if st.session_state.active_tool != selected_tool_name:
     st.session_state.search_results = []
     st.session_state.active_query = ""
@@ -693,7 +705,7 @@ with col_main:
                         st.image(media_bytes, use_container_width=True)
                     st.caption(f"**{clean_title}**")
                     raw_url = item.get("target_url", "")
-                    
+
                     btn_id = f"cp_btn_{idx}"
                     copy_html = f"""
                     <div style="margin-bottom: 10px;">
@@ -723,7 +735,7 @@ with col_main:
                     if media_bytes:
                         st.image(media_bytes, use_container_width=True)
                         st.caption(f"**{clean_title}**")
-                        
+
                         st.download_button(
                             label=f"⬇️ **Download Photo #{idx+1}**",
                             data=media_bytes,
@@ -740,7 +752,8 @@ with col_main:
                 elif tool_info["type"] == "video":
                     if media_bytes:
                         st.video(media_bytes)
-                        st.caption(f"**{clean_title}**")
+                        mb_size = len(media_bytes) / (1024 * 1024)
+                        st.caption(f"**{clean_title}** ({mb_size:.1f} MB)")
 
                         st.download_button(
                             label=f"⬇️ **Save Video #{idx+1} ({quality_choice})**",
@@ -754,7 +767,7 @@ with col_main:
                     elif item.get("stream_url"):
                         st.video(item["stream_url"])
                         st.caption(f"**{clean_title}**")
-                        st.warning("Video streaming only; download buffer unavailable.")
+                        st.error("Failed to slice buffer. Video available via source link below:")
 
                     if item.get("page_url"):
                         st.link_button("🌐 Source Link", item["page_url"], use_container_width=True)
